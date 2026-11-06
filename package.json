@@ -1,0 +1,37 @@
+{
+  "name": "injective-copytrade",
+  "version": "0.1.0",
+  "description": "Injective 链上聪明钱一键跟单系统 (CopyTrade MVP)",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "simulate": "tsx src/simulate.ts"
+  },
+  "keywords": [
+    "injective",
+    "copytrade",
+    "defi",
+    "trading-bot",
+    "smart-money"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@injectivelabs/networks": "^1.20.66",
+    "@injectivelabs/sdk-ts": "^1.20.66",
+    "@injectivelabs/ts-types": "^1.20.66",
+    "@injectivelabs/utils": "^1.20.66",
+    "bignumber.js": "^9.1.2",
+    "dotenv": "^16.4.7",
+    "grammy": "^1.46.0",
+    "https-proxy-agent": "^9.1.0",
+    "undici": "^8.12.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
