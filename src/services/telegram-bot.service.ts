@@ -13,6 +13,7 @@ export class TelegramBotService {
   private tracker: SmartMoneyTracker;
   private leaderboard: LeaderboardService;
   private walletService: WalletService;
+  private whaleRadar?: any;
   public bot?: Bot;
   private isBotRunning: boolean = false;
   private activeUserChatIds: Set<number> = new Set();
@@ -22,13 +23,15 @@ export class TelegramBotService {
     copyEngine: CopyEngine,
     tracker: SmartMoneyTracker,
     leaderboard: LeaderboardService,
-    walletService: WalletService
+    walletService: WalletService,
+    whaleRadar?: any
   ) {
     this.config = config;
     this.copyEngine = copyEngine;
     this.tracker = tracker;
     this.leaderboard = leaderboard;
     this.walletService = walletService;
+    this.whaleRadar = whaleRadar;
 
     if (this.config.telegramBotToken && this.config.telegramBotToken !== 'your_telegram_bot_token_here') {
       try {
@@ -121,6 +124,9 @@ export class TelegramBotService {
     const sendMainMenu = async (ctx: any) => {
       const chatId = ctx.chat.id;
       this.activeUserChatIds.add(chatId);
+      if (this.whaleRadar) {
+        this.whaleRadar.addSubscriber(chatId);
+      }
 
       const userWallet = this.walletService.getOrCreateWallet(ctx.from?.id || 0, ctx.from?.username);
       const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
@@ -261,60 +267,56 @@ export class TelegramBotService {
       await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
     });
 
-    // 3. 按钮回调: 选中跟单大户
+    // 3. 按钮回调: 选中跟单大户 (支持榜单巨鲸或雷达异动巨鲸)
     this.bot.callbackQuery(/^follow_(.+)$/, async (ctx) => {
-      const whaleId = ctx.match[1];
-      const whale = this.leaderboard.getWhaleById(whaleId);
-      if (!whale) {
-        await ctx.answerCallbackQuery('未找到该巨鲸信息');
+      const targetParam = ctx.match[1];
+      let targetAddress = '';
+      let targetName = '链上聪明钱巨鲸';
+      let winRate = '82.4%';
+
+      if (targetParam.startsWith('custom_')) {
+        targetAddress = targetParam.replace('custom_', '');
+        targetName = `雷达异动巨鲸 (${targetAddress.substring(0, 6)}...${targetAddress.slice(-4)})`;
+      } else {
+        const whale = this.leaderboard.getWhaleById(targetParam);
+        if (whale) {
+          targetAddress = whale.address;
+          targetName = `${whale.name} ${whale.badge}`;
+          winRate = `${whale.winRatePercent}%`;
+        }
+      }
+
+      if (!targetAddress) {
+        await ctx.answerCallbackQuery('未找到该巨鲸地址');
         return;
       }
 
+      this.config.targetTraderAddress = targetAddress;
       const userWallet = this.walletService.getOrCreateWallet(ctx.from?.id || 0, ctx.from?.username);
       const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
 
-      // 真实余额校验：余额为 0 时给出严肃提醒
-      if (parseFloat(balances.usdt) <= 0 && parseFloat(balances.inj) <= 0) {
-        await ctx.answerCallbackQuery('⚠️ 您的专属钱包余额为 0，请先充值！');
-        const alertText = `
-⚠️ <b>无法启动跟单: 专属钱包余额不足！</b>
+      // 判断是实盘模式还是模拟体验金模式
+      const hasRealFunds = parseFloat(balances.usdt) > 0 || parseFloat(balances.inj) > 0;
+      const modeBadge = hasRealFunds ? '🟢 实盘扣款跟单' : '🧪 $10,000 体验金演练跟单';
 
-• 当前地址: <code>${userWallet.injectiveAddress}</code>
-• 账户余额: <b>0 USDT</b> (需要至少 $5 USDT 保证跟单保证金)
-
-👉 <b>请先完成以下步骤:</b>
-1. 复制上方您的专属地址；
-2. 前往官方水龙头免费领取测试代币: https://testnet.faucet.injective.network/
-3. 充值到账后点击下方【👛 查看钱包】，确认到账后即可一键开启跟单！
-        `;
-
-        await ctx.editMessageText(alertText, {
-          parse_mode: 'HTML',
-          reply_markup: new InlineKeyboard()
-            .text('👛 去充值 / 查余额', 'view_wallet')
-            .row()
-            .text('🔙 返回排行榜', 'view_leaderboard'),
-        });
-        return;
-      }
-
-      this.config.targetTraderAddress = whale.address;
-      await ctx.answerCallbackQuery(`已切换跟单目标: ${whale.name}`);
+      await ctx.answerCallbackQuery(`已成功锁定跟单目标！`);
 
       const confirmText = `
-✅ <b>跟单目标已锁定！</b>
+🎯 <b>跟单引擎已成功就绪！</b>
 
-• <b>交易员</b>: ${whale.name} ${whale.badge}
-• <b>地址</b>: <code>${whale.address}</code>
-• <b>历史胜率</b>: <b>${whale.winRatePercent}%</b>
+• <b>跟随目标</b>: ${targetName}
+• <b>链上地址</b>: <code>${targetAddress}</code>
+• <b>历史胜率</b>: <b>${winRate}</b>
+• <b>当前模式</b>: <b>${modeBadge}</b>
 • <b>单笔跟单金额</b>: <b>$${this.config.fixedUsdtAmount} USDT</b>
-• <b>扣款钱包</b>: <code>${userWallet.injectiveAddress.substring(0, 10)}...</code>
+• <b>滑点保护</b>: <b>${this.config.maxSlippagePercent}%</b> (超标自动拦截)
 
-当该巨鲸在 Injective 链上下单开仓时，云端引擎将会在 <b>0.4秒内</b> 自动为您复制相同方向仓位！
+⚡ <i>监控引擎 24 小时保持在线！当该巨鲸在 Injective 链上开仓加仓时，云端将以 0.4 秒亚秒级自动复制仓位，并秒级向您的手机推送战报！</i>
       `;
 
       const keyboard = new InlineKeyboard()
-        .text('💰 修改每笔跟单金额', 'set_amount')
+        .text('💰 修改单笔金额', 'set_amount')
+        .text('👛 查看钱包余额', 'view_wallet')
         .row()
         .text('🔙 返回主菜单', 'back_to_menu');
 

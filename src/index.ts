@@ -5,6 +5,7 @@ import { SmartMoneyTracker } from './services/smart-money-tracker.js';
 import { CopyEngine } from './services/copy-engine.js';
 import { LeaderboardService } from './services/leaderboard.service.js';
 import { WalletService } from './services/wallet.service.js';
+import { WhaleRadarService } from './services/whale-radar.service.js';
 import { TelegramBotService } from './services/telegram-bot.service.js';
 
 async function main() {
@@ -43,18 +44,25 @@ async function main() {
     process.exit(1);
   }
 
-  // 2. 初始化风控、执行引擎与用户钱包服务
+  // 2. 初始化风控、执行引擎、用户钱包服务与巨鲸雷达
   const riskManager = new RiskManager(config);
   const copyEngine = new CopyEngine(config, injectiveService, riskManager);
   const leaderboard = new LeaderboardService();
   const walletService = new WalletService(config, injectiveService.endpoints);
+  const whaleRadar = new WhaleRadarService(config, injectiveService.endpoints);
 
   // 3. 初始化聪明钱监听器
   const tracker = new SmartMoneyTracker(config, injectiveService);
 
   // 4. 初始化并启动 Telegram 手机端机器人服务
-  const telegramBot = new TelegramBotService(config, copyEngine, tracker, leaderboard, walletService);
+  const telegramBot = new TelegramBotService(config, copyEngine, tracker, leaderboard, walletService, whaleRadar);
   await telegramBot.start();
+  if (telegramBot.bot) {
+    whaleRadar.setBot(telegramBot.bot);
+  }
+  const allMarketIds = Array.from((await injectiveService.loadMarkets()).keys());
+  whaleRadar.setMonitoredMarkets(allMarketIds);
+  await whaleRadar.start(6000);
 
   // 5. 绑定事件：大户交易捕获 -> TG 广播 -> 执行跟单 -> TG 推送结果
   tracker.on('trade', async (event) => {
