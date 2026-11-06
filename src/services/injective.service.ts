@@ -34,11 +34,32 @@ export class InjectiveService {
   constructor(config: AppConfig) {
     this.config = config;
     this.endpoints = getNetworkEndpoints(config.network);
+    if (config.customEndpoints) {
+      if (config.customEndpoints.indexer) this.endpoints.indexer = config.customEndpoints.indexer;
+      if (config.customEndpoints.grpc) this.endpoints.grpc = config.customEndpoints.grpc;
+      if (config.customEndpoints.rest) this.endpoints.rest = config.customEndpoints.rest;
+      if (config.customEndpoints.rpc) this.endpoints.rpc = config.customEndpoints.rpc;
+    }
     this.derivativesApi = new IndexerGrpcDerivativesApi(this.endpoints.indexer);
     this.derivativesStream = new IndexerGrpcDerivativesStream(this.endpoints.indexer);
 
     this.initFollowerWallet();
     this.initTargetSubaccount();
+  }
+
+  /**
+   * 动态更新目标监听钱包地址与子账户
+   */
+  public setTargetTrader(address: string, subaccountIndex: number = 0) {
+    this.config.targetTraderAddress = address;
+    this.config.targetSubaccountIndex = subaccountIndex;
+    try {
+      this.targetSubaccountId = getSubaccountId(address, subaccountIndex);
+    } catch {
+      if (address.startsWith('0x')) {
+        this.targetSubaccountId = address;
+      }
+    }
   }
 
   /**

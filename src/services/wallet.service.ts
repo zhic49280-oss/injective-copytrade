@@ -11,6 +11,8 @@ export interface UserWallet {
   subaccountId: string;
   privateKeyHex: string;
   createdAt: number;
+  practiceMode?: boolean;
+  practiceBalanceUsdt?: number;
 }
 
 export class WalletService {
@@ -76,6 +78,8 @@ export class WalletService {
         subaccountId,
         privateKeyHex: pk.toPrivateKeyHex(),
         createdAt: Date.now(),
+        practiceMode: false,
+        practiceBalanceUsdt: 10000,
       };
 
       this.wallets.set(telegramId, wallet);
@@ -83,6 +87,24 @@ export class WalletService {
       console.log(`[WalletService] 🆕 为用户 @${username || telegramId} 生成真实 Injective 钱包: ${injectiveAddress}`);
     }
     return wallet;
+  }
+
+  /**
+   * 设置体验金模式状态
+   */
+  public setPracticeMode(telegramId: number, enabled: boolean): UserWallet {
+    const wallet = this.getOrCreateWallet(telegramId);
+    wallet.practiceMode = enabled;
+    if (enabled && (!wallet.practiceBalanceUsdt || wallet.practiceBalanceUsdt <= 0)) {
+      wallet.practiceBalanceUsdt = 10000;
+    }
+    this.saveWallets();
+    return wallet;
+  }
+
+  public isPracticeMode(telegramId: number): boolean {
+    const wallet = this.wallets.get(telegramId);
+    return wallet ? !!wallet.practiceMode : false;
   }
 
   /**
@@ -101,6 +123,8 @@ export class WalletService {
       subaccountId,
       privateKeyHex: cleanPk,
       createdAt: Date.now(),
+      practiceMode: false,
+      practiceBalanceUsdt: 10000,
     };
 
     this.wallets.set(telegramId, wallet);

@@ -6,6 +6,7 @@ dotenv.config();
 
 export interface AppConfig {
   network: Network;
+  networkName: 'mainnet' | 'testnet';
   followerPrivateKey: string;
   followerSubaccountIndex: number;
   targetTraderAddress: string;
@@ -22,16 +23,36 @@ export interface AppConfig {
   telegramBotToken?: string;
   telegramBroadcastChatId?: string;
   referralRewardPercent: number;
+  customEndpoints?: {
+    indexer?: string;
+    grpc?: string;
+    rest?: string;
+    rpc?: string;
+  };
 }
 
-const networkStr = (process.env.NETWORK || 'testnet').toLowerCase();
-const network = networkStr === 'mainnet' ? Network.Mainnet : Network.Testnet;
+export function parseNetwork(netStr?: string): { network: Network; networkName: 'mainnet' | 'testnet' } {
+  const clean = (netStr || process.env.NETWORK || 'testnet').trim().toLowerCase();
+  if (clean === 'mainnet' || clean === 'main' || clean === 'mainnet-k8s') {
+    return { network: Network.Mainnet, networkName: 'mainnet' };
+  }
+  return { network: Network.Testnet, networkName: 'testnet' };
+}
+
+const resolvedNetwork = parseNetwork(process.env.NETWORK);
+
+// 默认已验证活跃聪明钱地址 (Testnet 与 Mainnet)
+const DEFAULT_TARGET_ADDRESS =
+  resolvedNetwork.networkName === 'mainnet'
+    ? 'inj1xah26mtc37j3rt5rd3u8heg07rhvhjr64l9u5g'
+    : 'inj1zd8e0mh95hle4l5y2n8ts94pkkzq25vg8aj0xp';
 
 export const config: AppConfig = {
-  network,
+  network: resolvedNetwork.network,
+  networkName: resolvedNetwork.networkName,
   followerPrivateKey: process.env.FOLLOWER_PRIVATE_KEY || '',
   followerSubaccountIndex: parseInt(process.env.FOLLOWER_SUBACCOUNT_INDEX || '0', 10),
-  targetTraderAddress: process.env.TARGET_TRADER_ADDRESS || '',
+  targetTraderAddress: process.env.TARGET_TRADER_ADDRESS || DEFAULT_TARGET_ADDRESS,
   targetSubaccountIndex: parseInt(process.env.TARGET_SUBACCOUNT_INDEX || '0', 10),
   copyMode: (process.env.COPY_MODE?.toUpperCase() === 'RATIO' ? 'RATIO' : 'FIXED_AMOUNT') as CopyMode,
   fixedUsdtAmount: parseFloat(process.env.FIXED_USDT_AMOUNT || '50'),
@@ -45,17 +66,23 @@ export const config: AppConfig = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || '',
   telegramBroadcastChatId: process.env.TELEGRAM_BROADCAST_CHAT_ID || '',
   referralRewardPercent: parseFloat(process.env.REFERRAL_REWARD_PERCENT || '25'),
+  customEndpoints: {
+    indexer: process.env.INDEXER_ENDPOINT,
+    grpc: process.env.GRPC_ENDPOINT,
+    rest: process.env.REST_ENDPOINT,
+    rpc: process.env.RPC_ENDPOINT,
+  },
 };
 
 export function validateConfig(cfg: AppConfig = config) {
   const errors: string[] = [];
 
   if (!cfg.targetTraderAddress) {
-    errors.push('TARGET_TRADER_ADDRESS 不能为空，请在 .env 中设置要监听的聪明钱地址。');
+    errors.push('未指定初始监听地址，将等待用户在 Telegram 输入或点击榜单锁定。');
   }
 
   if (!cfg.dryRun && (!cfg.followerPrivateKey || cfg.followerPrivateKey === 'your_private_key_here')) {
-    errors.push('真实跟单模式需要配置 FOLLOWER_PRIVATE_KEY。若仅用于监听或模拟测试，可设置 DRY_RUN=true。');
+    errors.push('真实跟单模式需配置 FOLLOWER_PRIVATE_KEY。未配置时系统支持体验金演练或 DRY_RUN 模拟。');
   }
 
   if (cfg.maxLeverage <= 0 || cfg.maxLeverage > 50) {

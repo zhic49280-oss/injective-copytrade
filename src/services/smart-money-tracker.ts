@@ -57,6 +57,45 @@ export class SmartMoneyTracker extends EventEmitter {
   }
 
   /**
+   * 动态切换监听的目标聪明钱地址并即刻启动监听
+   */
+  public async updateTargetTrader(address: string, subaccountIndex: number = 0): Promise<string> {
+    console.log(`[SmartMoneyTracker] 🎯 正在切换监控目标钱包至: ${address} (Subaccount: ${subaccountIndex})`);
+    this.injectiveService.setTargetTrader(address, subaccountIndex);
+    const newSubaccount = this.injectiveService.targetSubaccountId;
+
+    if (this.isRunning) {
+      if (this.pollTimer) {
+        clearInterval(this.pollTimer);
+        this.pollTimer = undefined;
+      }
+      if (this.streamSubscription && typeof this.streamSubscription.unsubscribe === 'function') {
+        try {
+          this.streamSubscription.unsubscribe();
+        } catch (e) {
+          // ignore
+        }
+        this.streamSubscription = undefined;
+      }
+
+      if (newSubaccount) {
+        await this.seedInitialTrades(newSubaccount);
+        this.startRealtimeStream();
+        this.startPolling();
+      }
+    }
+
+    return newSubaccount || '';
+  }
+
+  public getTargetTrader(): { address: string; subaccountId?: string } {
+    return {
+      address: this.config.targetTraderAddress,
+      subaccountId: this.injectiveService.targetSubaccountId,
+    };
+  }
+
+  /**
    * 建立 gRPC 实时流订阅
    */
   private startRealtimeStream() {

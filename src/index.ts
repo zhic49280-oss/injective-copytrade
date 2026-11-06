@@ -47,9 +47,14 @@ async function main() {
   // 2. 初始化风控、执行引擎、用户钱包服务与巨鲸雷达
   const riskManager = new RiskManager(config);
   const copyEngine = new CopyEngine(config, injectiveService, riskManager);
-  const leaderboard = new LeaderboardService();
+  const leaderboard = new LeaderboardService(injectiveService.endpoints, config.networkName);
   const walletService = new WalletService(config, injectiveService.endpoints);
   const whaleRadar = new WhaleRadarService(config, injectiveService.endpoints);
+
+  const allMarketIds = Array.from((await injectiveService.loadMarkets()).keys());
+  console.log(`[Init] 🏆 正在聚合 Injective 链上真实巨鲸战绩榜单...`);
+  await leaderboard.refreshLeaderboard(allMarketIds);
+  console.log(`[Init] ✅ 链上聪明钱榜单聚合完成，当前前列大户数: ${leaderboard.getTopWhales().length}`);
 
   // 3. 初始化聪明钱监听器
   const tracker = new SmartMoneyTracker(config, injectiveService);
@@ -60,7 +65,6 @@ async function main() {
   if (telegramBot.bot) {
     whaleRadar.setBot(telegramBot.bot);
   }
-  const allMarketIds = Array.from((await injectiveService.loadMarkets()).keys());
   whaleRadar.setMonitoredMarkets(allMarketIds);
   await whaleRadar.start(6000);
 
