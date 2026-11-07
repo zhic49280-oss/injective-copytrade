@@ -72,6 +72,9 @@ export class TelegramBotService {
           },
         });
         this.setupBotHandlers();
+        this.bot.catch((err) => {
+          console.error(`[TelegramBot] 处理器异常捕获:`, err.message);
+        });
       } catch (err: any) {
         console.warn(`[TelegramBot] 初始化失败:`, err.message);
       }
@@ -79,48 +82,53 @@ export class TelegramBotService {
   }
 
   /**
-   * 启动 Telegram Bot 监听
+   * 启动 Telegram Bot 监听 (自带 Webhook 清理与 409 冲突自动恢复)
    */
   public async start() {
     if (!this.bot) {
       console.log(`\n------------------------------------------------------------`);
       console.log(`[TelegramBot] ℹ️ 未配置 TELEGRAM_BOT_TOKEN。`);
-      console.log(`  📱 手机端接管提示:`);
-      console.log(`  1. 打开手机 Telegram 搜索 @BotFather`);
-      console.log(`  2. 发送 /newbot 并输入名字，10秒即可获得 Bot API Token`);
-      console.log(`  3. 填入 .env 的 TELEGRAM_BOT_TOKEN 中重启，手机即刻拥有完整交互界面！`);
       console.log(`------------------------------------------------------------\n`);
       return;
     }
 
     if (this.isBotRunning) return;
+    this.isBotRunning = true;
 
     try {
-      this.isBotRunning = true;
+      await this.bot.api.deleteWebhook({ drop_pending_updates: false }).catch(() => {});
       this.bot.api
         .setMyCommands([
           { command: 'start', description: '🚀 打开完整跟单控制台' },
           { command: 'track', description: '🔍 监控自定义 Injective 钱包' },
-          { command: 'leaderboard', description: '🏆 链上聪明钱胜率排行榜' },
+          { command: 'leaderboard', description: '🏆 链上实盘聪明钱排行榜' },
           { command: 'amount', description: '💰 设置单笔跟单金额' },
           { command: 'referral', description: '🎁 邀请好友赚 25% 返佣' },
           { command: 'stats', description: '📊 实时运行战绩看板' },
         ])
-        .catch((e) => console.warn('[TelegramBot] setMyCommands 忽略:', e.message));
+        .catch(() => {});
 
-      this.bot
-        .start({
-          onStart: (botInfo) => {
-            console.log(`\n============================================================`);
-            console.log(`[TelegramBot] 🤖 手机端 Telegram 机器人已成功上线！`);
-            console.log(`  - Bot 用户名: @${botInfo.username}`);
-            console.log(`  - 状态: 7x24 小时监听中，现在掏出手机发送 /start 即可操作！`);
-            console.log(`============================================================\n`);
-          },
-        })
-        .catch((err) => {
-          console.error(`[TelegramBot] 轮询异常:`, err.message);
-        });
+      const launchPolling = () => {
+        if (!this.bot || !this.isBotRunning) return;
+        this.bot
+          .start({
+            onStart: (botInfo) => {
+              console.log(`\n============================================================`);
+              console.log(`[TelegramBot] 🤖 手机端 Telegram 机器人已成功上线！`);
+              console.log(`  - Bot 用户名: @${botInfo.username}`);
+              console.log(`  - 状态: 7x24 小时监听中，现在掏出手机发送 /start 即可操作！`);
+              console.log(`============================================================\n`);
+            },
+          })
+          .catch((err) => {
+            console.warn(`[TelegramBot] 轮询重连中 (${err.message})，3秒后自动恢复...`);
+            if (this.isBotRunning) {
+              setTimeout(launchPolling, 3000);
+            }
+          });
+      };
+
+      launchPolling();
     } catch (err: any) {
       console.error(`[TelegramBot] 启动失败:`, err.message);
     }
@@ -249,6 +257,58 @@ ${balanceDisplay}
       parse_mode: 'HTML',
       reply_markup: keyboard,
     });
+  }
+
+  /**
+   * 渲染 100% 链上真实撮合聚合的巨鲸榜单 (零虚假保底数字)
+   */
+  private async renderLeaderboardView(ctx: any) {
+    let whales = this.leaderboard.getTopWhales(5);
+    if (whales.length === 0) {
+      await this.leaderboard.refreshLeaderboard();
+      whales = this.leaderboard.getTopWhales(5);
+    }
+
+    let text = `🏆 <b>Injective 链上实盘聪明钱榜 (100% 链上原始撮合统计)</b>\n`;
+    text += `<i>数据直接聚合自 Injective 衍生品订单簿最新真实区块成交，零估算公式</i>\n\n`;
+    const keyboard = new InlineKeyboard();
+
+    whales.forEach((w) => {
+      const pnlSign = w.monthlyPnlUsd > 0 ? '+' : '';
+      const pnlDisplay =
+        w.closingTrades > 0
+          ? `<b>${pnlSign}$${w.monthlyPnlUsd.toLocaleString()}</b> (${w.winningTrades}盈/${w.closingTrades}平)`
+          : `<i>持仓建仓中 (暂无平仓结算)</i>`;
+
+      const winRateDisplay =
+        w.closingTrades > 0 ? `<b>${w.winRatePercent}%</b>` : `<i>建仓中</i>`;
+
+      text += `<b>Top ${w.rank}. ${w.name}</b> ${w.badge}\n`;
+      text += `• 近期成交额: <b>$${w.volumeUsd.toLocaleString()} USD</b> (${w.totalTrades} 笔成交)\n`;
+      text += `• 实盘平仓胜率: ${winRateDisplay} | 已实现盈亏: ${pnlDisplay}\n`;
+      text += `• 链上行为特征: <i>${w.strategy}</i>\n`;
+      text += `• 钱包地址: <code>${w.address}</code>\n\n`;
+
+      keyboard.text(`⚡ 跟单 Top ${w.rank} (0x${w.address.slice(-4)})`, `follow_${w.id}`).row();
+    });
+
+    keyboard
+      .text('🔄 实时重扫链上区块', 'refresh_leaderboard')
+      .text('🔍 监控自定义钱包', 'track_custom_wallet')
+      .row()
+      .text('🔙 返回主菜单', 'back_to_menu');
+
+    try {
+      await ctx.editMessageText(text, {
+        parse_mode: 'HTML',
+        reply_markup: keyboard,
+      });
+    } catch (e) {
+      await ctx.reply(text, {
+        parse_mode: 'HTML',
+        reply_markup: keyboard,
+      });
+    }
   }
 
   /**
@@ -408,62 +468,14 @@ ${balanceDisplay}
 
     // 查看聪明钱排行榜
     this.bot.callbackQuery('view_leaderboard', async (ctx) => {
-      await ctx.answerCallbackQuery('正在拉取链上最新交易数据...').catch(() => {});
-      const whales = this.leaderboard.getTopWhales(5);
-
-      let text = `🏆 <b>Injective 链上高频活跃巨鲸榜 (实时撮合聚合)</b>\n\n`;
-      const keyboard = new InlineKeyboard();
-
-      whales.forEach((w) => {
-        text += `<b>Top ${w.rank}. ${w.name}</b> ${w.badge}\n`;
-        text += `• 胜率: <b>${w.winRatePercent}%</b> | 月收益估值: <b>+$${w.monthlyPnlUsd.toLocaleString()}</b>\n`;
-        text += `• 交易频次: ${w.totalTrades} 笔 | 最大回撤: <b>${w.maxDrawdownPercent}%</b>\n`;
-        text += `• 主打策略: <i>${w.strategy}</i>\n`;
-        text += `• 钱包: <code>${w.address}</code>\n\n`;
-
-        keyboard.text(`⚡ 跟单 Top ${w.rank}`, `follow_${w.id}`).row();
-      });
-
-      keyboard
-        .text('🔄 刷新榜单', 'refresh_leaderboard')
-        .text('🔍 监控自定义钱包', 'track_custom_wallet')
-        .row()
-        .text('🔙 返回主菜单', 'back_to_menu');
-
-      await ctx.editMessageText(text, {
-        parse_mode: 'HTML',
-        reply_markup: keyboard,
-      });
+      await ctx.answerCallbackQuery('正在读取链上真实撮合数据...').catch(() => {});
+      await this.renderLeaderboardView(ctx);
     });
 
     this.bot.callbackQuery('refresh_leaderboard', async (ctx) => {
-      await ctx.answerCallbackQuery('正在扫描链上最新区块撮合记录...').catch(() => {});
+      await ctx.answerCallbackQuery('正在扫描 Injective 主网最新区块成交...').catch(() => {});
       await this.leaderboard.refreshLeaderboard();
-      // 重新触发展示
-      const whales = this.leaderboard.getTopWhales(5);
-      let text = `🏆 <b>Injective 链上高频活跃巨鲸榜 (实时撮合聚合)</b>\n\n`;
-      const keyboard = new InlineKeyboard();
-
-      whales.forEach((w) => {
-        text += `<b>Top ${w.rank}. ${w.name}</b> ${w.badge}\n`;
-        text += `• 胜率: <b>${w.winRatePercent}%</b> | 月收益估值: <b>+$${w.monthlyPnlUsd.toLocaleString()}</b>\n`;
-        text += `• 交易频次: ${w.totalTrades} 笔 | 最大回撤: <b>${w.maxDrawdownPercent}%</b>\n`;
-        text += `• 主打策略: <i>${w.strategy}</i>\n`;
-        text += `• 钱包: <code>${w.address}</code>\n\n`;
-
-        keyboard.text(`⚡ 跟单 Top ${w.rank}`, `follow_${w.id}`).row();
-      });
-
-      keyboard
-        .text('🔄 刷新榜单', 'refresh_leaderboard')
-        .text('🔍 监控自定义钱包', 'track_custom_wallet')
-        .row()
-        .text('🔙 返回主菜单', 'back_to_menu');
-
-      await ctx.editMessageText(text, {
-        parse_mode: 'HTML',
-        reply_markup: keyboard,
-      });
+      await this.renderLeaderboardView(ctx);
     });
 
     // 钱包详情与充值

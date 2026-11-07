@@ -6,7 +6,7 @@ import {
 import { Network, getNetworkEndpoints } from '@injectivelabs/networks';
 
 /**
- * Injective 链上真实巨鲸战绩榜单数据结构
+ * Injective 链上真实巨鲸战绩榜单数据结构 (100% 源于链上真实 Trade 数据聚合，零捏造公式)
  */
 export interface WhaleProfile {
   id: string;
@@ -15,19 +15,22 @@ export interface WhaleProfile {
   badge: string;
   address: string;
   subaccountIndex: number;
-  winRatePercent: number;
-  monthlyPnlUsd: number;
-  maxDrawdownPercent: number;
-  totalTrades: number;
-  volumeUsd: number;
-  favoriteMarket: string;
-  strategy: string;
+  winRatePercent: number;       // 真实平仓胜率 (Winning Closes / Total Closes)
+  monthlyPnlUsd: number;        // 真实已实现盈亏 (Realized PnL USD)
+  maxDrawdownPercent: number;   // 真实最大单笔亏损占成交额比
+  totalTrades: number;          // 采样窗口内真实成交笔数
+  closingTrades: number;        // 采样窗口内真实平仓结算笔数
+  winningTrades: number;        // 采样窗口内真实盈利平仓笔数
+  volumeUsd: number;            // 采样窗口内真实成交额 (USD)
+  favoriteMarket: string;       // 真实最活跃交易标的
+  strategy: string;             // 真实链上交易特征 (如: Taker 比例、主买/主卖方向)
   isRealOnChain: boolean;
   lastActiveTime?: number;
 }
 
 export class LeaderboardService {
   private derivativesApi: IndexerGrpcDerivativesApi;
+  private mainnetApi: IndexerGrpcDerivativesApi;
   private networkName: 'mainnet' | 'testnet';
   private whales: WhaleProfile[] = [];
   private isRefreshing: boolean = false;
@@ -35,167 +38,92 @@ export class LeaderboardService {
   constructor(endpoints?: { indexer: string }, networkName: 'mainnet' | 'testnet' = 'testnet') {
     this.networkName = networkName;
     const defaultEndpoints = getNetworkEndpoints(
-      networkName === 'mainnet' ? Network.Mainnet : Network.Testnet
+      networkName === 'mainnet' ? Network.MainnetSentry : Network.TestnetSentry
     );
     const indexerUrl = endpoints?.indexer || defaultEndpoints.indexer;
     this.derivativesApi = new IndexerGrpcDerivativesApi(indexerUrl);
+    // 同时持有 Mainnet Sentry 索引器用于拉取主网真实大户战绩参考
+    this.mainnetApi = new IndexerGrpcDerivativesApi(getNetworkEndpoints(Network.MainnetSentry).indexer);
 
-    // 初始化已验证链上大户作为基准池
-    this.whales = this.getVerifiedFallbackWhales();
+    this.whales = [];
   }
 
   /**
-   * 已验证真实链上活跃大户与做市商基准数据 (零 Mock，全部为真实 Injective 地址)
-   */
-  private getVerifiedFallbackWhales(): WhaleProfile[] {
-    if (this.networkName === 'mainnet') {
-      return [
-        {
-          id: 'whale_1',
-          rank: 1,
-          name: 'Helix 核心套利大户 0x9u5g',
-          badge: '👑 链上主力',
-          address: 'inj1xah26mtc37j3rt5rd3u8heg07rhvhjr64l9u5g',
-          subaccountIndex: 0,
-          winRatePercent: 83.6,
-          monthlyPnlUsd: 218400,
-          maxDrawdownPercent: 7.8,
-          totalTrades: 624,
-          volumeUsd: 2850000,
-          favoriteMarket: 'INJ/USDT PERP',
-          strategy: '右侧放量突破 + 高频网格扫盘',
-          isRealOnChain: true,
-        },
-        {
-          id: 'whale_2',
-          rank: 2,
-          name: '衍生品动量基金 0xfs7',
-          badge: '⚡ 敏锐游资',
-          address: 'inj1d7hxgyzchxmf6urjpadmfz0xtcuxx583atgfs7',
-          subaccountIndex: 0,
-          winRatePercent: 79.4,
-          monthlyPnlUsd: 142000,
-          maxDrawdownPercent: 9.2,
-          totalTrades: 418,
-          volumeUsd: 1640000,
-          favoriteMarket: 'BTC/USDT PERP',
-          strategy: '多空双向动量追踪 + 阶梯分批止盈',
-          isRealOnChain: true,
-        },
-        {
-          id: 'whale_3',
-          rank: 3,
-          name: '跨期基差量化 0xce6j',
-          badge: '🛡️ 稳健长盈',
-          address: 'inj14au3ajhycqssvm3agdt2msvqcdgyvg5ewgce6j',
-          subaccountIndex: 0,
-          winRatePercent: 86.2,
-          monthlyPnlUsd: 96500,
-          maxDrawdownPercent: 5.4,
-          totalTrades: 350,
-          volumeUsd: 1120000,
-          favoriteMarket: 'ETH/USDT PERP',
-          strategy: '期现利差对冲 + 跨期平价套利',
-          isRealOnChain: true,
-        },
-      ];
-    }
-
-    // 测试网真实活跃地址 (经真实撮合验证)
-    return [
-      {
-        id: 'whale_1',
-        rank: 1,
-        name: 'Injective 链上主力 0x0xp',
-        badge: '👑 链上主力',
-        address: 'inj1zd8e0mh95hle4l5y2n8ts94pkkzq25vg8aj0xp',
-        subaccountIndex: 0,
-        winRatePercent: 82.5,
-        monthlyPnlUsd: 168000,
-        maxDrawdownPercent: 8.6,
-        totalTrades: 512,
-        volumeUsd: 1980000,
-        favoriteMarket: 'INJ/USDC PERP',
-        strategy: '突破追随 + 高频订单薄扫盘',
-        isRealOnChain: true,
-      },
-      {
-        id: 'whale_2',
-        rank: 2,
-        name: '高频活跃巨鲸 0x3ruk',
-        badge: '⚡ 高频大户',
-        address: 'inj1qw7jk82hjvf79tnjykux6zacuh9gl0z0wl3ruk',
-        subaccountIndex: 0,
-        winRatePercent: 78.8,
-        monthlyPnlUsd: 114500,
-        maxDrawdownPercent: 7.9,
-        totalTrades: 388,
-        volumeUsd: 1320000,
-        favoriteMarket: 'INJ/USDC PERP',
-        strategy: '15分钟均线共振 + 震荡低吸高抛',
-        isRealOnChain: true,
-      },
-      {
-        id: 'whale_3',
-        rank: 3,
-        name: '做市流动性巨鲸 0xfs7',
-        badge: '🛡️ 稳健量化',
-        address: 'inj1d7hxgyzchxmf6urjpadmfz0xtcuxx583atgfs7',
-        subaccountIndex: 0,
-        winRatePercent: 85.1,
-        monthlyPnlUsd: 87300,
-        maxDrawdownPercent: 6.2,
-        totalTrades: 290,
-        volumeUsd: 940000,
-        favoriteMarket: 'BTC/USDT PERP',
-        strategy: '跨期套利 + 波动率均值回归',
-        isRealOnChain: true,
-      },
-    ];
-  }
-
-  /**
-   * 动态从 Injective 链上抓取最新交易记录并聚合成聪明钱排行
+   * 100% 从 Injective 链上 Indexer 抓取真实衍生品交易并计算真实链上指标
+   * 绝不使用任何随机数、哈希取模或保底数字公式！
    */
   public async refreshLeaderboard(monitoredMarketIds: string[] = []): Promise<WhaleProfile[]> {
     if (this.isRefreshing) return this.whales;
     this.isRefreshing = true;
 
     try {
-      let marketIds = monitoredMarketIds.slice(0, 10);
-      if (marketIds.length === 0) {
-        const markets = await this.derivativesApi.fetchMarkets();
-        marketIds = markets.slice(0, 8).map((m) => m.marketId);
+      // 优先使用 Mainnet 衍生品主市场获取真实真金白银巨鲸数据，如果当前指定了测试网也合并当前网络真实成交
+      const apiToUse = this.mainnetApi;
+      const markets = await apiToUse.fetchMarkets();
+
+      // 筛选主流永续合约市场 (SOL, BTC, ETH, INJ 等高流动性市场)
+      const majorTickers = ['SOL/USDC PERP', 'BTC/USDC PERP', 'ETH/USDC PERP', 'INJ/USDC PERP', 'DOGE/USDC PERP', 'SUI/USDC PERP'];
+      let targetMarkets = markets.filter((m) => majorTickers.includes(m.ticker));
+      if (targetMarkets.length === 0) {
+        targetMarkets = markets.slice(0, 6);
       }
 
-      if (marketIds.length === 0) {
+      const marketTickerMap = new Map<string, string>();
+      for (const m of markets) {
+        marketTickerMap.set(m.marketId, m.ticker);
+      }
+
+      // 并发拉取各主流市场最新真实链上成交记录
+      const tradePromises = targetMarkets.slice(0, 6).map((m) =>
+        apiToUse
+          .fetchTrades({
+            marketId: m.marketId,
+            pagination: { limit: 100 },
+          })
+          .then((r) => r.trades || [])
+          .catch(() => [] as any[])
+      );
+
+      // 如果运行在 testnet，也拉取当前网络交易以便测试网活跃地址也能上榜
+      if (this.networkName === 'testnet' && monitoredMarketIds.length > 0) {
+        tradePromises.push(
+          this.derivativesApi
+            .fetchTrades({
+              marketIds: monitoredMarketIds.slice(0, 6),
+              pagination: { limit: 100 },
+            })
+            .then((r) => r.trades || [])
+            .catch(() => [] as any[])
+        );
+      }
+
+      const tradeArrays = await Promise.all(tradePromises);
+      const allTrades = tradeArrays.flat();
+
+      if (allTrades.length === 0) {
         this.isRefreshing = false;
         return this.whales;
       }
 
-      const res = await this.derivativesApi.fetchTrades({
-        marketIds,
-        pagination: { limit: 100 },
-      });
-
-      if (!res || !res.trades || res.trades.length === 0) {
-        this.isRefreshing = false;
-        return this.whales;
-      }
-
-      // 聚合各链上交易者
+      // 聚合每个真实链上地址的真实交易数据
       const traderMap = new Map<
         string,
         {
           address: string;
           tradeCount: number;
+          closingCount: number;
+          winningCount: number;
+          realizedPnlUsd: number;
           volumeUsd: number;
-          marketCounts: Record<string, number>;
+          takerCount: number;
+          buyCount: number;
+          maxLossUsd: number;
+          marketVolumes: Record<string, number>;
           lastTimestamp: number;
         }
       >();
 
-      for (const trade of res.trades) {
+      for (const trade of allTrades) {
         if (!trade.subaccountId) continue;
 
         let traderAddr = '';
@@ -205,7 +133,6 @@ export class LeaderboardService {
           continue;
         }
 
-        // 验证 Bech32 格式合法性
         try {
           const parsed = Address.fromBech32(traderAddr);
           if (parsed.toBech32() !== traderAddr) continue;
@@ -213,22 +140,52 @@ export class LeaderboardService {
           continue;
         }
 
+        // Injective Derivative Indexer 中 USDC/USDT 永续合约的 price, margin, pnl 均为 1e6 精度
         const rawPrice = parseFloat(trade.executionPrice || '0');
         const price = rawPrice > 10000 ? rawPrice / 1e6 : rawPrice;
         const qty = parseFloat(trade.executionQuantity || '0');
-        const notional = price * qty;
+        const notionalUsd = price * qty;
+
+        const rawPnl = parseFloat(trade.pnl || '0');
+        const pnlUsd = rawPnl / 1e6;
 
         const current = traderMap.get(traderAddr) || {
           address: traderAddr,
           tradeCount: 0,
+          closingCount: 0,
+          winningCount: 0,
+          realizedPnlUsd: 0,
           volumeUsd: 0,
-          marketCounts: {},
+          takerCount: 0,
+          buyCount: 0,
+          maxLossUsd: 0,
+          marketVolumes: {} as Record<string, number>,
           lastTimestamp: trade.executedAt || Date.now(),
         };
 
         current.tradeCount += 1;
-        current.volumeUsd += notional;
-        current.marketCounts[trade.marketId] = (current.marketCounts[trade.marketId] || 0) + 1;
+        current.volumeUsd += notionalUsd;
+        current.realizedPnlUsd += pnlUsd;
+
+        if (pnlUsd !== 0) {
+          current.closingCount += 1;
+          if (pnlUsd > 0) {
+            current.winningCount += 1;
+          } else if (Math.abs(pnlUsd) > current.maxLossUsd) {
+            current.maxLossUsd = Math.abs(pnlUsd);
+          }
+        }
+
+        if (trade.executionSide === 'taker') {
+          current.takerCount += 1;
+        }
+        if (trade.tradeDirection === 'buy') {
+          current.buyCount += 1;
+        }
+
+        const ticker = marketTickerMap.get(trade.marketId) || 'INJ/USDC PERP';
+        current.marketVolumes[ticker] = (current.marketVolumes[ticker] || 0) + notionalUsd;
+
         if (trade.executedAt && trade.executedAt > current.lastTimestamp) {
           current.lastTimestamp = trade.executedAt;
         }
@@ -236,77 +193,88 @@ export class LeaderboardService {
         traderMap.set(traderAddr, current);
       }
 
-      // 按综合得分排序 (成交量与交易频次)
-      const sorted = Array.from(traderMap.values()).sort(
-        (a, b) => b.volumeUsd * 0.7 + b.tradeCount * 50 - (a.volumeUsd * 0.7 + a.tradeCount * 50)
-      );
+      // 优先按真实已实现正向盈利 + 真实成交额排序
+      const sorted = Array.from(traderMap.values())
+        .filter((t) => t.volumeUsd > 0)
+        .sort((a, b) => {
+          // 有真實正收益的優先排前面，其次按真實成交量排序
+          if (a.realizedPnlUsd > 0 && b.realizedPnlUsd <= 0) return -1;
+          if (b.realizedPnlUsd > 0 && a.realizedPnlUsd <= 0) return 1;
+          if (a.realizedPnlUsd !== b.realizedPnlUsd && (a.realizedPnlUsd > 0 || b.realizedPnlUsd > 0)) {
+            return b.realizedPnlUsd - a.realizedPnlUsd;
+          }
+          return b.volumeUsd - a.volumeUsd;
+        });
 
-      const dynamicWhales: WhaleProfile[] = [];
-      const badges = ['👑 链上主力', '⚡ 敏锐游资', '🛡️ 稳健长盈', '💎 深度量化', '🎯 趋势突击'];
-      const strategies = [
-        '右侧放量突破 + 高频网格扫盘',
-        '多空动量追踪 + 阶梯分批止盈',
-        '宏观跨期对冲 + 波动率套利',
-        '深度做市 + 盘口滑点保护收割',
-        '15分钟均线共振波段跟随',
-      ];
+      const realWhales: WhaleProfile[] = [];
 
       for (let i = 0; i < sorted.length && i < 5; i++) {
         const item = sorted[i];
-        // 找出最常交易的市场 ID
-        let favMarketId = '';
-        let maxCount = 0;
-        for (const [mId, count] of Object.entries(item.marketCounts)) {
-          if (count > maxCount) {
-            maxCount = count;
-            favMarketId = mId;
+
+        // 找出真实成交额最大的市场
+        let favMarket = 'SOL/USDC PERP';
+        let maxVol = -1;
+        for (const [mTicker, vol] of Object.entries(item.marketVolumes)) {
+          if (vol > maxVol) {
+            maxVol = vol;
+            favMarket = mTicker;
           }
         }
 
-        // 计算动态胜率与收益 (基于链上成交规模 Heuristic)
-        const addrHash = item.address.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0);
-        const winRate = Number((78.5 + (addrHash % 90) / 10).toFixed(1));
-        const estimatedMonthlyPnl = Math.round(Math.max(52000, item.volumeUsd * 12 + (addrHash % 50000)));
-        const maxDrawdown = Number((5.8 + (addrHash % 55) / 10).toFixed(1));
+        // 真实胜率计算：如果有平仓记录，则为 盈利平仓数 / 总平仓数；若全为开仓建仓单，标注为 0 (界面显示“建仓中”)
+        const realWinRate =
+          item.closingCount > 0
+            ? Number(((item.winningCount / item.closingCount) * 100).toFixed(1))
+            : 0;
 
-        dynamicWhales.push({
+        // 真实交易特征描述
+        const takerRatio = Math.round((item.takerCount / item.tradeCount) * 100);
+        const buyRatio = Math.round((item.buyCount / item.tradeCount) * 100);
+        const sideDesc = buyRatio >= 60 ? '偏多头建仓' : buyRatio <= 40 ? '偏空头建仓' : '多空双向交投';
+        const execDesc = takerRatio >= 50 ? '主动吃单 (Taker)' : '限价挂单 (Maker)';
+        const realStrategy = `主交投 ${favMarket} | ${execDesc} ${takerRatio}% | ${sideDesc}`;
+
+        // 真实标签
+        let badge = '📊 链上实盘';
+        if (item.realizedPnlUsd > 0 && realWinRate >= 60) {
+          badge = '🏆 实盘盈利巨鲸';
+        } else if (item.volumeUsd >= 10000) {
+          badge = '🐋 大额成交主力';
+        } else if (item.tradeCount >= 10) {
+          badge = '⚡ 高频活跃交易者';
+        }
+
+        const drawdownPct =
+          item.volumeUsd > 0
+            ? Number(Math.min(100, (item.maxLossUsd / item.volumeUsd) * 100).toFixed(2))
+            : 0;
+
+        realWhales.push({
           id: `whale_chain_${i + 1}`,
           rank: i + 1,
-          name: `Injective 巨鲸 0x${item.address.slice(-4)}`,
-          badge: badges[i % badges.length],
+          name: `链上交易员 0x${item.address.slice(-4)}`,
+          badge,
           address: item.address,
           subaccountIndex: 0,
-          winRatePercent: winRate,
-          monthlyPnlUsd: estimatedMonthlyPnl,
-          maxDrawdownPercent: maxDrawdown,
-          totalTrades: Math.max(item.tradeCount * 12, 128),
-          volumeUsd: Math.round(item.volumeUsd),
-          favoriteMarket: favMarketId ? 'INJ/USDC PERP' : 'INJ/USDT PERP',
-          strategy: strategies[i % strategies.length],
+          winRatePercent: realWinRate,
+          monthlyPnlUsd: Number(item.realizedPnlUsd.toFixed(2)),
+          maxDrawdownPercent: drawdownPct,
+          totalTrades: item.tradeCount,
+          closingTrades: item.closingCount,
+          winningTrades: item.winningCount,
+          volumeUsd: Number(item.volumeUsd.toFixed(2)),
+          favoriteMarket: favMarket,
+          strategy: realStrategy,
           isRealOnChain: true,
           lastActiveTime: item.lastTimestamp,
         });
       }
 
-      // 如果链上聚合结果充实，优先采用；否则与基准池融合补充
-      if (dynamicWhales.length >= 3) {
-        this.whales = dynamicWhales;
-      } else {
-        const fallback = this.getVerifiedFallbackWhales();
-        const existingAddrs = new Set(dynamicWhales.map((w) => w.address.toLowerCase()));
-        for (const fb of fallback) {
-          if (!existingAddrs.has(fb.address.toLowerCase())) {
-            dynamicWhales.push({
-              ...fb,
-              rank: dynamicWhales.length + 1,
-              id: `whale_chain_${dynamicWhales.length + 1}`,
-            });
-          }
-        }
-        this.whales = dynamicWhales.slice(0, 5);
+      if (realWhales.length > 0) {
+        this.whales = realWhales;
       }
     } catch (err: any) {
-      console.warn(`[LeaderboardService] 动态聚合链上交易时告警 (已启用已验证基准榜单):`, err.message);
+      console.warn(`[LeaderboardService] 链上实时聚合警告:`, err.message);
     } finally {
       this.isRefreshing = false;
     }
@@ -327,7 +295,7 @@ export class LeaderboardService {
   }
 
   /**
-   * 注册用户自定义跟踪的钱包为榜单识别项
+   * 注册用户自定义跟踪的钱包
    */
   public registerCustomWhale(address: string): WhaleProfile {
     const existing = this.getWhaleByAddress(address);
@@ -336,17 +304,19 @@ export class LeaderboardService {
     const profile: WhaleProfile = {
       id: `custom_${address}`,
       rank: 99,
-      name: `自定义监控目标 0x${address.slice(-4)}`,
-      badge: '🔍 专属监控',
+      name: `自定义监控 0x${address.slice(-4)}`,
+      badge: '🔍 链上实盘跟踪',
       address,
       subaccountIndex: 0,
-      winRatePercent: 80.0,
-      monthlyPnlUsd: 100000,
-      maxDrawdownPercent: 8.0,
-      totalTrades: 100,
-      volumeUsd: 500000,
-      favoriteMarket: 'INJ/USDC PERP',
-      strategy: '用户指定自定义监听雷达',
+      winRatePercent: 0,
+      monthlyPnlUsd: 0,
+      maxDrawdownPercent: 0,
+      totalTrades: 0,
+      closingTrades: 0,
+      winningTrades: 0,
+      volumeUsd: 0,
+      favoriteMarket: '全市场监听',
+      strategy: '用户自定义指定链上地址',
       isRealOnChain: true,
       lastActiveTime: Date.now(),
     };
