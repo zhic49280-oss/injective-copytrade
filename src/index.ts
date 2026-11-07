@@ -56,8 +56,12 @@ async function main() {
   await leaderboard.refreshLeaderboard(allMarketIds);
   console.log(`[Init] ✅ 链上聪明钱榜单聚合完成，当前前列大户数: ${leaderboard.getTopWhales().length}`);
 
-  // 3. 初始化聪明钱监听器
+  // 3. 初始化聪明钱监听器并恢复所有活跃用户的多巨鲸跟单矩阵
   const tracker = new SmartMoneyTracker(config, injectiveService);
+  const activeTargets = walletService.getAllActiveTrackedAddresses();
+  for (const addr of activeTargets) {
+    await tracker.addTrackedTrader(addr);
+  }
 
   // 4. 初始化并启动 Telegram 手机端机器人服务
   const telegramBot = new TelegramBotService(config, copyEngine, tracker, leaderboard, walletService, whaleRadar);
@@ -77,8 +81,8 @@ async function main() {
       // 执行自动跟单与风控
       const result = await copyEngine.handleSignal(event);
 
-      // 手机端秒级推送跟单结果
-      await telegramBot.notifyCopyTradeResult(result);
+      // 手机端秒级推送跟单结果 (区分模拟盘演练与用户专属私钥实盘广播)
+      await telegramBot.notifyCopyTradeResult(result, event);
     } catch (e: any) {
       console.error(`[Main] 信号处理异常:`, e.message);
     }

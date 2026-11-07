@@ -92,7 +92,32 @@ export class CopyEngine {
     console.log(`  - 所需保证金: $${riskResult.calculatedMargin} (${riskResult.leverage}x 杠杆)`);
     console.log(`  - 运行模式: ${this.config.dryRun ? '🧪 DRY_RUN (模拟)' : '🔴 LIVE (真实上链)'}`);
 
-    // 4. 提交订单
+    // 4. 提交订单 (若未配置全局 followerAddress 且处于多用户独立钱包模式，则返回风控基准参数交由下游按各用户独立钱包执行)
+    if (!this.injectiveService.followerAddress && !this.config.dryRun) {
+      const latency = Date.now() - startTime;
+      this.successfulOrdersCount++;
+
+      console.log(`\n=========================================================`);
+      console.log(`[CopyEngine] 🎯 风控核算通过 (多用户独立钱包路由模式)！`);
+      console.log(`  - 基准价格: $${riskResult.adjustedPrice} | 基准数量: ${riskResult.adjustedQuantity}`);
+      console.log(`  - 核算耗时: ${latency} ms`);
+      console.log(`  - 累计放行单数: ${this.successfulOrdersCount} / ${this.totalOrdersCount}`);
+      console.log(`=========================================================\n`);
+
+      return {
+        success: true,
+        sourceEventId: event.id,
+        txHash: undefined,
+        marketTicker: event.marketTicker,
+        direction: event.direction,
+        executedQuantity: riskResult.adjustedQuantity,
+        executionPrice: riskResult.adjustedPrice,
+        margin: riskResult.calculatedMargin,
+        leverage: riskResult.leverage,
+        executionTimeMs: latency,
+      };
+    }
+
     try {
       const orderResp = await this.injectiveService.executeDerivativeMarketOrder({
         marketId: event.marketId,
@@ -142,6 +167,10 @@ export class CopyEngine {
         error: err.message || String(err),
       };
     }
+  }
+
+  public getInjectiveService(): InjectiveService {
+    return this.injectiveService;
   }
 
   public getStats() {

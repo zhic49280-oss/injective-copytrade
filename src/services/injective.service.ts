@@ -257,4 +257,93 @@ export class InjectiveService {
       message: orderMsg,
     };
   }
+
+  /**
+   * 使用用户自己在机器人中生成的专属钱包私钥 (userPrivateKeyHex) 签名并向 Injective 主网真实广播市价单
+   */
+  public async executeUserRealMarketOrder(
+    userPrivateKeyHex: string,
+    params: {
+      marketId: string;
+      direction: TradeDirection;
+      quantity: number;
+      price: number;
+      leverage: number;
+      simulateOnly?: boolean;
+    }
+  ): Promise<{ txHash: string; message: any; injectiveAddress: string; subaccountId: string }> {
+    const cleanPk = userPrivateKeyHex.trim().startsWith('0x')
+      ? userPrivateKeyHex.trim()
+      : `0x${userPrivateKeyHex.trim()}`;
+    const pk = PrivateKey.fromHex(cleanPk);
+    const injectiveAddress = pk.toBech32();
+    const subaccountId = getSubaccountId(injectiveAddress, 0);
+
+    const market = this.getMarket(params.marketId);
+    if (!market) {
+      throw new Error(`找不到市场详情: ${params.marketId}`);
+    }
+
+    const isBuy = params.direction === 'BUY';
+    const orderType = isBuy ? OrderTypeMap.BUY : OrderTypeMap.SELL;
+
+    const decimals = market.quoteTokenDecimals;
+    const chainPrice = derivativePriceToChainPriceToFixed({
+      value: params.price,
+      tensMultiplier: decimals,
+    });
+    const chainQuantity = derivativeQuantityToChainQuantityToFixed({
+      value: params.quantity,
+    });
+
+    const notional = new BigNumber(params.price).multipliedBy(params.quantity);
+    const marginAmount = notional.dividedBy(params.leverage).toNumber();
+    const chainMargin = derivativeMarginToChainMarginToFixed({
+      value: marginAmount,
+      tensMultiplier: decimals,
+    });
+
+    const feeRecipient = this.config.feeRecipient || injectiveAddress;
+
+    const orderMsg = MsgCreateDerivativeMarketOrder.fromJSON({
+      injectiveAddress,
+      subaccountId,
+      marketId: params.marketId,
+      orderType,
+      price: chainPrice,
+      quantity: chainQuantity,
+      margin: chainMargin,
+      feeRecipient,
+    });
+
+    const userBroadcaster = new MsgBroadcasterWithPk({
+      privateKey: cleanPk,
+      network: this.config.network,
+      endpoints: {
+        indexer: this.endpoints.indexer,
+        grpc: this.endpoints.grpc,
+        rest: this.endpoints.rest,
+      },
+    });
+
+    if (params.simulateOnly) {
+      return {
+        txHash: '',
+        message: orderMsg,
+        injectiveAddress,
+        subaccountId,
+      };
+    }
+
+    const response = await userBroadcaster.broadcast({
+      msgs: [orderMsg],
+    });
+
+    return {
+      txHash: response.txHash,
+      message: orderMsg,
+      injectiveAddress,
+      subaccountId,
+    };
+  }
 }

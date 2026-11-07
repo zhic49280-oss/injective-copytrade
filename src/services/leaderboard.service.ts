@@ -31,6 +31,8 @@ export interface WhaleProfile {
   strategy: string;             // 真实重仓明细描述 (如: 做多 INJ/USDC PERP 浮盈 +$14,685)
   isRealOnChain: boolean;
   lastActiveTime?: number;
+  lastTradeMinutesAgo?: number; // 距离最近一笔真实链上成交的分钟数
+  lastActiveDesc: string;       // 链上活跃度描述 (如: 🔥 刚刚交易 (1分钟前))
 }
 
 export class LeaderboardService {
@@ -39,6 +41,7 @@ export class LeaderboardService {
   private networkName: 'mainnet' | 'testnet';
   private whales: WhaleProfile[] = [];
   private isRefreshing: boolean = false;
+  private lastRefreshTime: number = 0;
 
   constructor(endpoints?: { indexer: string }, networkName: 'mainnet' | 'testnet' = 'testnet') {
     this.networkName = networkName;
@@ -54,9 +57,29 @@ export class LeaderboardService {
     this.whales = [];
   }
 
+  public getLastRefreshTime(): number {
+    return this.lastRefreshTime;
+  }
+
+  private formatActiveDesc(minutesAgo: number): string {
+    if (minutesAgo <= 1) {
+      return '🔥 刚刚交易 (1分钟前)';
+    }
+    if (minutesAgo < 60) {
+      return `🔥 ${minutesAgo}分钟前交易`;
+    }
+    if (minutesAgo <= 1440) {
+      const hours = Math.floor(minutesAgo / 60);
+      const mins = minutesAgo % 60;
+      return mins > 0 ? `⚡ ${hours}小时${mins}分钟前交易` : `⚡ ${hours}小时前交易`;
+    }
+    const days = Math.floor(minutesAgo / 1440);
+    return `🕒 ${days}天前交易`;
+  }
+
   /**
    * 深度扫描 Injective 主网全市场真实未平仓巨鲸仓位 (fetchPositionsV2) + 真实历史成交 (fetchTrades)
-   * 100% 链上真金白银实盘数据，零随机数、零保底公式！
+   * 严格剔除数月不交易的“僵尸死仓”，优先筛选 24 小时内有真实交易动作的活跃高浮盈巨鲸！
    */
   public async refreshLeaderboard(_monitoredMarketIds: string[] = []): Promise<WhaleProfile[]> {
     if (this.isRefreshing) return this.whales;
@@ -163,30 +186,71 @@ export class LeaderboardService {
         whaleMap.set(addr, cur);
       }
 
-      // 筛选出真正高浮盈且有实盘规模的链上巨鲸，按真实总浮盈 (totalUnrealizedPnlUsd) 降序排列
+      // 筛选出 totalUnrealizedPnlUsd > 50 && totalNotionalUsd >= 500 的前 15 名候选巨鲸
       const topCandidates = Array.from(whaleMap.values())
         .filter((w) => w.totalUnrealizedPnlUsd > 50 && w.totalNotionalUsd >= 500)
         .sort((a, b) => b.totalUnrealizedPnlUsd - a.totalUnrealizedPnlUsd)
-        .slice(0, 5);
+        .slice(0, 15);
 
-      const finalWhales: WhaleProfile[] = [];
-
-      // 2. 为前 5 名巨鲸并发查询其子账户最近 100 笔真实平仓历史，补充交易频次与胜率
+      // 2. 并发查询这 15 名候选巨鲸子账户的最新交易记录 (limit: 30)
       const tradeDetails = await Promise.all(
         topCandidates.map((cand) =>
           this.mainnetApi
             .fetchTrades({
               subaccountId: cand.subaccountId,
-              pagination: { limit: 100 },
+              pagination: { limit: 30 },
             })
             .then((r) => r.trades || [])
             .catch(() => [] as any[])
         )
       );
 
+      const evaluatedCandidates: Array<{
+        cand: (typeof topCandidates)[0];
+        trades: any[];
+        lastTradeMinutesAgo: number;
+        lastTradeTimestamp: number;
+      }> = [];
+
+      const now = Date.now();
       for (let i = 0; i < topCandidates.length; i++) {
-        const item = topCandidates[i];
+        const cand = topCandidates[i];
         const trades = tradeDetails[i] || [];
+        let lastTradeTimestamp = 0;
+        for (const t of trades) {
+          const rawTs = Number(t.executedAt || 0);
+          const ts = rawTs > 0 && rawTs < 1e12 ? rawTs * 1000 : rawTs;
+          if (ts > lastTradeTimestamp) {
+            lastTradeTimestamp = ts;
+          }
+        }
+        const lastTradeMinutesAgo =
+          lastTradeTimestamp > 0
+            ? Math.max(0, Math.round((now - lastTradeTimestamp) / 60000))
+            : 999999;
+
+        evaluatedCandidates.push({
+          cand,
+          trades,
+          lastTradeMinutesAgo,
+          lastTradeTimestamp,
+        });
+      }
+
+      // 严格剔除僵尸死仓：优先筛选 24 小时内 (lastTradeMinutesAgo <= 1440) 有真实交易动作的活跃盈利巨鲸
+      const active24h = evaluatedCandidates
+        .filter((item) => item.lastTradeMinutesAgo <= 1440)
+        .sort((a, b) => b.cand.totalUnrealizedPnlUsd - a.cand.totalUnrealizedPnlUsd);
+
+      const fallbackRecent = evaluatedCandidates
+        .filter((item) => item.lastTradeMinutesAgo > 1440)
+        .sort((a, b) => a.lastTradeMinutesAgo - b.lastTradeMinutesAgo);
+
+      const selectedTop5 = [...active24h, ...fallbackRecent].slice(0, 5);
+      const finalWhales: WhaleProfile[] = [];
+
+      for (let i = 0; i < selectedTop5.length; i++) {
+        const { cand: item, trades, lastTradeMinutesAgo, lastTradeTimestamp } = selectedTop5[i];
 
         let realizedPnlUsd = 0;
         let closingCount = 0;
@@ -250,12 +314,15 @@ export class LeaderboardService {
           favoriteMarket: best ? best.ticker : 'INJ/USDC PERP',
           strategy: bestDesc,
           isRealOnChain: true,
-          lastActiveTime: Date.now(),
+          lastActiveTime: lastTradeTimestamp || Date.now(),
+          lastTradeMinutesAgo,
+          lastActiveDesc: this.formatActiveDesc(lastTradeMinutesAgo),
         });
       }
 
       if (finalWhales.length > 0) {
         this.whales = finalWhales;
+        this.lastRefreshTime = Date.now();
       }
     } catch (err: any) {
       console.warn(`[LeaderboardService] 扫描链上巨鲸实盘持仓告警:`, err.message);
@@ -308,6 +375,8 @@ export class LeaderboardService {
       strategy: '用户自定义指定链上地址',
       isRealOnChain: true,
       lastActiveTime: Date.now(),
+      lastTradeMinutesAgo: 0,
+      lastActiveDesc: '🟢 实时流监控中',
     };
 
     this.whales.push(profile);
