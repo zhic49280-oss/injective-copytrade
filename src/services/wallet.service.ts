@@ -13,6 +13,10 @@ export interface UserWallet {
   createdAt: number;
   practiceMode?: boolean;
   practiceBalanceUsdt?: number;
+  isCopyingEnabled?: boolean;
+  targetTraderAddress?: string;
+  targetTraderName?: string;
+  copyAmountUsdt?: number;
 }
 
 export class WalletService {
@@ -105,6 +109,63 @@ export class WalletService {
   public isPracticeMode(telegramId: number): boolean {
     const wallet = this.wallets.get(telegramId);
     return wallet ? !!wallet.practiceMode : false;
+  }
+
+  /**
+   * 获取用户个性化跟单配置与状态
+   */
+  public getUserCopyState(telegramId: number) {
+    const wallet = this.getOrCreateWallet(telegramId);
+    return {
+      isCopyingEnabled: !!wallet.isCopyingEnabled,
+      targetTraderAddress: wallet.targetTraderAddress,
+      targetTraderName: wallet.targetTraderName,
+      copyAmountUsdt: wallet.copyAmountUsdt || 100,
+      practiceMode: !!wallet.practiceMode,
+    };
+  }
+
+  /**
+   * 设置用户的跟单目标
+   */
+  public setUserTarget(telegramId: number, targetAddress: string, targetName?: string): UserWallet {
+    const wallet = this.getOrCreateWallet(telegramId);
+    wallet.targetTraderAddress = targetAddress;
+    wallet.targetTraderName = targetName;
+    this.saveWallets();
+    return wallet;
+  }
+
+  /**
+   * 启动或停止用户的自动跟单
+   */
+  public setUserCopying(telegramId: number, enabled: boolean): UserWallet {
+    const wallet = this.getOrCreateWallet(telegramId);
+    wallet.isCopyingEnabled = enabled;
+    this.saveWallets();
+    return wallet;
+  }
+
+  /**
+   * 设置用户单笔跟单金额
+   */
+  public setUserAmount(telegramId: number, amount: number): UserWallet {
+    const wallet = this.getOrCreateWallet(telegramId);
+    wallet.copyAmountUsdt = amount;
+    this.saveWallets();
+    return wallet;
+  }
+
+  /**
+   * 清除跟单目标
+   */
+  public clearUserTarget(telegramId: number): UserWallet {
+    const wallet = this.getOrCreateWallet(telegramId);
+    wallet.targetTraderAddress = undefined;
+    wallet.targetTraderName = undefined;
+    wallet.isCopyingEnabled = false;
+    this.saveWallets();
+    return wallet;
   }
 
   /**

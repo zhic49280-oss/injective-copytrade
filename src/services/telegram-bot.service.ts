@@ -139,13 +139,21 @@ export class TelegramBotService {
   /**
    * 生成统一的完整控制台键盘 (8大核心功能按钮)
    */
-  private getMainMenuKeyboard(): InlineKeyboard {
+  /**
+   * 生成统一的完整控制台键盘 (8大核心功能按钮，支持一键启停跟单)
+   */
+  private getMainMenuKeyboard(userId?: number): InlineKeyboard {
+    const copyState = userId ? this.walletService.getUserCopyState(userId) : undefined;
+    const isCopying = copyState?.isCopyingEnabled;
+    const toggleBtnText = isCopying ? '⏸️ 暂停自动跟单' : '⚡ 开启自动跟单';
+    const toggleBtnAction = isCopying ? 'pause_copy' : 'start_copy';
+
     return new InlineKeyboard()
       .text('👛 我的钱包', 'view_wallet')
       .text('🏆 聪明钱榜单', 'view_leaderboard')
       .row()
       .text('🔍 监控自定义钱包', 'track_custom_wallet')
-      .text('⚡ 一键跟单设置', 'config_copy')
+      .text(toggleBtnText, toggleBtnAction)
       .row()
       .text('💰 修改金额', 'set_amount')
       .text('🛡️ 风控设置', 'view_risk')
@@ -155,35 +163,40 @@ export class TelegramBotService {
   }
 
   /**
-   * 生成专业、严谨的主控制面板文案 (去除所有 crude faucet 词汇)
+   * 生成专业、严谨的主控制面板文案 (严格基于用户个人选择，默认未配置、未启动)
    */
   private async getMainMenuText(userId: number, username?: string): Promise<string> {
     const userWallet = this.walletService.getOrCreateWallet(userId, username);
+    const userCopy = this.walletService.getUserCopyState(userId);
     const isPractice = this.walletService.isPracticeMode(userId);
     const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
 
-    let targetWhale = this.leaderboard.getWhaleByAddress(this.config.targetTraderAddress);
     let targetDesc = '';
-    if (targetWhale) {
-      targetDesc = `${targetWhale.name} (${targetWhale.badge})`;
-    } else if (this.config.targetTraderAddress) {
-      targetDesc = `<code>${this.config.targetTraderAddress.substring(0, 10)}...${this.config.targetTraderAddress.slice(-6)}</code>`;
+    if (userCopy.targetTraderAddress) {
+      const targetWhale = this.leaderboard.getWhaleByAddress(userCopy.targetTraderAddress);
+      if (targetWhale) {
+        targetDesc = `${targetWhale.name} (${targetWhale.badge})`;
+      } else {
+        targetDesc = `<code>${userCopy.targetTraderAddress.substring(0, 10)}...${userCopy.targetTraderAddress.slice(-6)}</code>`;
+      }
     } else {
-      targetDesc = '未锁定 (轻点下方榜单或自定义监控)';
+      targetDesc = '⚪ 暂未选择 (请点击下方榜单或自定义监控)';
     }
 
     const hasRealFunds = parseFloat(balances.usdt) > 0 || parseFloat(balances.inj) > 0;
     let modeText = '';
-    if (isPractice) {
-      modeText = '🧪 $10,000 体验金演练中 (0风险)';
+    if (!userCopy.isCopyingEnabled) {
+      modeText = '⚪ 未启动 (尚未开启跟单)';
+    } else if (isPractice) {
+      modeText = '🟢 自动跟单中 (🧪 $10,000 体验金演练)';
     } else if (hasRealFunds) {
-      modeText = '🔴 链上实盘自动跟单';
+      modeText = '🟢 自动跟单中 (🔴 链上实盘扣款)';
     } else {
-      modeText = '⚪ 待充值激活 / 支持一键体验金演练';
+      modeText = '⚪ 待充值激活 (实盘余额不足)';
     }
 
     const balanceDisplay = isPractice
-      ? `• <b>体验金可用本金</b>: <b>$10,000 USDT</b>\n• <b>链上实际存入</b>: <code>${balances.inj} INJ</code> | <code>${balances.usdt} USDT</code>`
+      ? `• <b>体验金可用本金</b>: <b>$${userWallet.practiceBalanceUsdt || 10000} USDT</b>\n• <b>链上实际存入</b>: <code>${balances.inj} INJ</code> | <code>${balances.usdt} USDT</code>`
       : `• <b>链上实盘资产</b>: <b>${balances.inj} INJ</b> | <b>${balances.usdt} USDT</b> (估值 ~$${balances.totalUsd} USD)`;
 
     return `
@@ -195,9 +208,9 @@ export class TelegramBotService {
 ${balanceDisplay}
 <i>(资产完全存储于您的链上专属地址，随时支持私钥导出与安全提现)</i>
 
-🎯 <b>跟单核心引擎状态</b>:
+🎯 <b>个人跟单引擎状态</b>:
 • <b>监听目标</b>: ${targetDesc}
-• <b>跟单模式</b>: <b>${this.config.copyMode === 'FIXED_AMOUNT' ? `$${this.config.fixedUsdtAmount} USDT/单 (固定金额)` : `${(this.config.copyRatio * 100).toFixed(0)}% 仓位比例`}</b>
+• <b>单笔金额</b>: <b>$${userCopy.copyAmountUsdt} USDT/单</b>
 • <b>交易状态</b>: <b>${modeText}</b>
 • <b>风控保护</b>: 杠杆 <b>${this.config.maxLeverage}x</b> | 滑点保护 <b>${this.config.maxSlippagePercent}%</b>
 • <b>链路响应</b>: 🟢 gRPC 毫秒级流式监听 24h 待命
@@ -218,7 +231,7 @@ ${balanceDisplay}
     }
 
     const text = await this.getMainMenuText(userId, username);
-    const keyboard = this.getMainMenuKeyboard();
+    const keyboard = this.getMainMenuKeyboard(userId);
 
     if (isEdit) {
       try {
@@ -277,12 +290,10 @@ ${balanceDisplay}
   private setupBotHandlers() {
     if (!this.bot) return;
 
-    // 日志中间件
+    // 仅记录必要指令输入，过滤所有按钮点击刷屏，降低服务器日志负担
     this.bot.use(async (ctx, next) => {
-      if (ctx.message?.text) {
-        console.log(`[TelegramBot] 📩 用户 @${ctx.from?.username || ctx.from?.id}: "${ctx.message.text}"`);
-      } else if (ctx.callbackQuery?.data) {
-        console.log(`[TelegramBot] 🔘 按钮 @${ctx.from?.username || ctx.from?.id}: "${ctx.callbackQuery.data}"`);
+      if (ctx.message?.text?.startsWith('/')) {
+        console.log(`[TelegramBot] 指令 @${ctx.from?.username || ctx.from?.id}: ${ctx.message.text}`);
       }
       await next();
     });
@@ -591,26 +602,79 @@ ${balanceDisplay}
       await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
     });
 
+    // 开启自动跟单
+    this.bot.callbackQuery('start_copy', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      const copyState = this.walletService.getUserCopyState(userId);
+      const userWallet = this.walletService.getOrCreateWallet(userId, ctx.from?.username);
+      const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
+      const hasRealFunds = parseFloat(balances.usdt) > 0 || parseFloat(balances.inj) > 0;
+
+      // 1. 检查是否已指定跟单目标
+      if (!copyState.targetTraderAddress) {
+        await ctx.answerCallbackQuery().catch(() => {});
+        const text = `
+⚠️ <b>【尚未选择跟单目标】</b>
+
+您当前尚未绑定任何巨鲸或聪明钱地址。
+请先点击下方【🏆 聪明钱榜单】挑选链上最高胜率巨鲸，或点击【🔍 监控自定义钱包】输入您想跟随的 Injective 钱包地址。
+        `.trim();
+
+        const keyboard = new InlineKeyboard()
+          .text('🏆 前往聪明钱榜单选巨鲸', 'view_leaderboard')
+          .text('🔍 监控自定义钱包', 'track_custom_wallet')
+          .row()
+          .text('🔙 返回主菜单', 'back_to_menu');
+
+        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+        return;
+      }
+
+      // 2. 检查是否有资金或开启体验金
+      if (!hasRealFunds && !copyState.practiceMode) {
+        await ctx.answerCallbackQuery().catch(() => {});
+        await this.promptZeroBalanceChoice(ctx, copyState.targetTraderAddress, true);
+        return;
+      }
+
+      // 3. 启动跟单
+      this.walletService.setUserCopying(userId, true);
+      this.config.targetTraderAddress = copyState.targetTraderAddress;
+      await this.tracker.updateTargetTrader(copyState.targetTraderAddress);
+      await ctx.answerCallbackQuery('🚀 自动跟单已成功启动！').catch(() => {});
+      await this.renderMainMenu(ctx, true);
+    });
+
+    // 暂停自动跟单
+    this.bot.callbackQuery('pause_copy', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      this.walletService.setUserCopying(userId, false);
+      await ctx.answerCallbackQuery('⏸️ 自动跟单已暂停').catch(() => {});
+      await this.renderMainMenu(ctx, true);
+    });
+
     // 跟单设定
     this.bot.callbackQuery('config_copy', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      const copyState = this.walletService.getUserCopyState(userId);
+      const isCopying = copyState.isCopyingEnabled;
+
       const text = `
 ⚡ <b>【一键跟单高级设置】</b>
 
-• <b>当前跟单模式</b>: <b>${this.config.copyMode === 'FIXED_AMOUNT' ? '固定金额 (Fixed Amount)' : '比例跟随 (Ratio)'}</b>
-• <b>单笔跟单金额</b>: <b>$${this.config.fixedUsdtAmount} USDT</b>
-• <b>比例跟单系数</b>: <b>${(this.config.copyRatio * 100).toFixed(0)}%</b>
+• <b>运行状态</b>: <b>${isCopying ? '🟢 自动跟单中 (ACTIVE)' : '⚪ 已暂停 / 未启动 (PAUSED)'}</b>
+• <b>跟单目标</b>: <b>${copyState.targetTraderAddress ? `<code>${copyState.targetTraderAddress.slice(0, 10)}...${copyState.targetTraderAddress.slice(-6)}</code>` : '未指定'}</b>
+• <b>单笔金额</b>: <b>$${copyState.copyAmountUsdt} USDT</b>
 • <b>最大单笔名义上限</b>: <b>$${this.config.maxNotionalPerOrder} USD</b>
 • <b>杠杆倍数限制</b>: <b>${this.config.maxLeverage}x</b>
 • <b>最大滑点保护</b>: <b>${this.config.maxSlippagePercent}%</b>
       `.trim();
 
       const keyboard = new InlineKeyboard()
-        .text('💰 修改单笔金额', 'set_amount')
+        .text(isCopying ? '⏸️ 暂停自动跟单' : '🟢 开启自动跟单', isCopying ? 'pause_copy' : 'start_copy')
+        .text('💰 修改金额', 'set_amount')
+        .row()
         .text('🛡️ 风控与滑点', 'view_risk')
-        .row()
-        .text('🔄 切换为比例模式', 'toggle_mode_ratio')
-        .text('🔄 切换为固定金额', 'toggle_mode_fixed')
-        .row()
         .text('🔙 返回主菜单', 'back_to_menu');
 
       await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
@@ -670,10 +734,12 @@ ${balanceDisplay}
 
     // 修改金额
     this.bot.callbackQuery('set_amount', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      const copyState = this.walletService.getUserCopyState(userId);
       const text = `
 💰 <b>选择每笔跟单的名义金额 (USDT):</b>
 
-当前设置: <b>$${this.config.fixedUsdtAmount} USDT</b>
+当前设置: <b>$${copyState.copyAmountUsdt} USDT</b>
 <i>建议根据个人风险偏好选择适度金额。</i>
       `.trim();
 
@@ -693,7 +759,9 @@ ${balanceDisplay}
     });
 
     this.bot.callbackQuery(/^amt_(\d+)$/, async (ctx) => {
+      const userId = ctx.from?.id || 0;
       const amt = parseInt(ctx.match[1], 10);
+      this.walletService.setUserAmount(userId, amt);
       this.config.fixedUsdtAmount = amt;
       await ctx.answerCallbackQuery(`金额已更新为 $${amt} USDT`);
       await ctx.editMessageText(`✅ 单笔跟单金额已成功设置为 <b>$${amt} USDT</b>！`, {
@@ -788,6 +856,12 @@ ${balanceDisplay}
     const isPractice = this.walletService.isPracticeMode(userId);
     const hasRealFunds = parseFloat(balances.usdt) > 0 || parseFloat(balances.inj) > 0;
 
+    const whale = this.leaderboard.getWhaleByAddress(targetAddress);
+    const name = whale ? `${whale.name} ${whale.badge}` : `自定义巨鲸 0x${targetAddress.slice(-4)}`;
+
+    // 记录用户选中的目标巨鲸
+    this.walletService.setUserTarget(userId, targetAddress, name);
+
     // 零余额处理逻辑: 如果实盘无资金且未激活体验金，引导清晰二选一选择
     if (!hasRealFunds && !isPractice) {
       if (isCallback) {
@@ -797,7 +871,8 @@ ${balanceDisplay}
       return;
     }
 
-    // 更新系统目标地址并启动监听
+    // 激活跟单
+    this.walletService.setUserCopying(userId, true);
     this.config.targetTraderAddress = targetAddress;
     await this.tracker.updateTargetTrader(targetAddress);
     this.leaderboard.registerCustomWhale(targetAddress);
@@ -806,10 +881,9 @@ ${balanceDisplay}
       await ctx.answerCallbackQuery('已成功锁定跟单目标！').catch(() => {});
     }
 
-    const whale = this.leaderboard.getWhaleByAddress(targetAddress);
-    const name = whale ? `${whale.name} ${whale.badge}` : `自定义巨鲸 0x${targetAddress.slice(-4)}`;
     const winRate = whale ? `${whale.winRatePercent}%` : '80.0%+ (链上活跃)';
     const modeBadge = isPractice ? '🧪 $10,000 体验金演练跟单' : '🔴 链上实盘扣款跟单';
+    const userCopy = this.walletService.getUserCopyState(userId);
 
     const confirmText = `
 🎯 <b>跟单引擎已成功锁定目标！</b>
@@ -818,16 +892,17 @@ ${balanceDisplay}
 • <b>链上地址</b>: <code>${targetAddress}</code>
 • <b>历史胜率</b>: <b>${winRate}</b>
 • <b>当前模式</b>: <b>${modeBadge}</b>
-• <b>单笔跟单金额</b>: <b>$${this.config.fixedUsdtAmount} USDT</b>
+• <b>单笔跟单金额</b>: <b>$${userCopy.copyAmountUsdt} USDT</b>
 • <b>滑点保护</b>: <b>${this.config.maxSlippagePercent}%</b> (超标自动拦截)
 
 ⚡ <i>监控引擎 24 小时保持在线！当该目标在 Injective 链上开仓加仓时，云端将以 0.4 秒亚秒级自动复制仓位，并秒级向您的手机推送战报！</i>
     `.trim();
 
     const keyboard = new InlineKeyboard()
+      .text('⏸️ 暂停自动跟单', 'pause_copy')
       .text('💰 修改单笔金额', 'set_amount')
-      .text('👛 查看钱包余额', 'view_wallet')
       .row()
+      .text('👛 查看钱包余额', 'view_wallet')
       .text('🔙 返回主菜单', 'back_to_menu');
 
     if (isCallback) {

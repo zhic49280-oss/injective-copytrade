@@ -110,8 +110,19 @@ export class SmartMoneyTracker extends EventEmitter {
           this.handleRawTrade(tradeResponse);
         },
         onStatusCallback: (status) => {
-          // 流异常或状态变更
-          console.warn(`[SmartMoneyTracker] gRPC Stream 状态变更:`, status);
+          // Injective gRPC Envoy 会对无交易空闲连接进行周期性重置 (DEADLINE_EXCEEDED / Gateway Timeout)
+          // 这是 HTTP/2 长连接心跳正常机制，底层与轮询兜底会自动无缝续期，静默过滤避免刷屏
+          if (
+            status?.code === 2 ||
+            status?.code === 1 ||
+            status?.details === 'Gateway Timeout' ||
+            (typeof (status as any)?.details === 'string' && (status as any).details.includes('Timeout'))
+          ) {
+            return;
+          }
+          if (status && status.code !== 0 && status.details) {
+            console.log(`[SmartMoneyTracker] gRPC Stream 状态更新: ${status.details}`);
+          }
         },
       });
       console.log(`[SmartMoneyTracker] ✅ 实时 gRPC Trade Stream 已就绪`);
