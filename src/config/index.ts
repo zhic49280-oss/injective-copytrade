@@ -61,7 +61,7 @@ export const config: AppConfig = {
   maxNotionalPerOrder: parseFloat(process.env.MAX_NOTIONAL_PER_ORDER || '200'),
   maxLeverage: parseFloat(process.env.MAX_LEVERAGE || '5'),
   dryRun: (process.env.DRY_RUN || 'false').toLowerCase() === 'true',
-  feeRecipient: process.env.FEE_RECIPIENT,
+  feeRecipient: process.env.FEE_RECIPIENT || 'inj10k7vw7thyltfjag0junlxfrd0nf4wjjc3grecn',
   pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || '3000', 10),
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || '',
   telegramBroadcastChatId: process.env.TELEGRAM_BROADCAST_CHAT_ID || '',

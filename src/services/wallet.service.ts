@@ -41,8 +41,21 @@ export class WalletService {
       if (fs.existsSync(this.storageFile)) {
         const raw = fs.readFileSync(this.storageFile, 'utf-8');
         const list: UserWallet[] = JSON.parse(raw);
+        let dirtyFixed = false;
         for (const item of list) {
+          if (
+            item.targetTraderAddress === 'inj10k7vw7thyltfjag0junlxfrd0nf4wjjc3grecn' ||
+            item.targetTraderAddress === item.injectiveAddress
+          ) {
+            item.targetTraderAddress = undefined;
+            item.targetTraderName = undefined;
+            item.isCopyingEnabled = false;
+            dirtyFixed = true;
+          }
           this.wallets.set(item.telegramId, item);
+        }
+        if (dirtyFixed) {
+          this.saveWallets();
         }
       }
     } catch (e: any) {
@@ -112,10 +125,19 @@ export class WalletService {
   }
 
   /**
-   * 获取用户个性化跟单配置与状态
+   * 获取用户个性化跟单配置与状态 (内置脏数据自愈保护)
    */
   public getUserCopyState(telegramId: number) {
     const wallet = this.getOrCreateWallet(telegramId);
+    if (
+      wallet.targetTraderAddress === 'inj10k7vw7thyltfjag0junlxfrd0nf4wjjc3grecn' ||
+      wallet.targetTraderAddress === wallet.injectiveAddress
+    ) {
+      wallet.targetTraderAddress = undefined;
+      wallet.targetTraderName = undefined;
+      wallet.isCopyingEnabled = false;
+      this.saveWallets();
+    }
     return {
       isCopyingEnabled: !!wallet.isCopyingEnabled,
       targetTraderAddress: wallet.targetTraderAddress,

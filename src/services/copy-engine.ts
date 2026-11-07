@@ -109,7 +109,7 @@ export class CopyEngine {
       console.log(`[CopyEngine] 🎯 跟单执行成功！`);
       console.log(`  - 交易哈希: ${orderResp.txHash}`);
       console.log(`  - 执行耗时: ${latency} ms`);
-      console.log(`  - 手续费返佣地址: ${this.injectiveService.followerAddress}`);
+      console.log(`  - 开发者 40% 手续费返佣地址: ${this.config.feeRecipient || this.injectiveService.followerAddress}`);
       console.log(`  - 累计成功单数: ${this.successfulOrdersCount} / ${this.totalOrdersCount}`);
       console.log(`=========================================================\n`);
 

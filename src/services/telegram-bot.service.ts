@@ -260,40 +260,33 @@ ${balanceDisplay}
   }
 
   /**
-   * 渲染 100% 链上真实撮合聚合的巨鲸榜单 (零虚假保底数字)
+   * 渲染 100% 链上真实持仓与撮合聚合的巨鲸榜单 (零虚假保底数字)
    */
-  private async renderLeaderboardView(ctx: any) {
+  public async renderLeaderboardView(ctx: any) {
     let whales = this.leaderboard.getTopWhales(5);
     if (whales.length === 0) {
       await this.leaderboard.refreshLeaderboard();
       whales = this.leaderboard.getTopWhales(5);
     }
 
-    let text = `🏆 <b>Injective 链上实盘聪明钱榜 (100% 链上原始撮合统计)</b>\n`;
-    text += `<i>数据直接聚合自 Injective 衍生品订单簿最新真实区块成交，零估算公式</i>\n\n`;
+    let text = `🏆 <b>Injective 主网实盘巨鲸持仓排行榜 (100% 链上实盘数据)</b>\n`;
+    text += `<i>实时扫描 Injective 主网前 1,000 个未平仓大户仓位与历史平仓战绩，零虚假估算</i>\n\n`;
     const keyboard = new InlineKeyboard();
 
     whales.forEach((w) => {
-      const pnlSign = w.monthlyPnlUsd > 0 ? '+' : '';
-      const pnlDisplay =
-        w.closingTrades > 0
-          ? `<b>${pnlSign}$${w.monthlyPnlUsd.toLocaleString()}</b> (${w.winningTrades}盈/${w.closingTrades}平)`
-          : `<i>持仓建仓中 (暂无平仓结算)</i>`;
-
-      const winRateDisplay =
-        w.closingTrades > 0 ? `<b>${w.winRatePercent}%</b>` : `<i>建仓中</i>`;
-
+      const upnlSign = w.unrealizedPnlUsd >= 0 ? '+' : '';
       text += `<b>Top ${w.rank}. ${w.name}</b> ${w.badge}\n`;
-      text += `• 近期成交额: <b>$${w.volumeUsd.toLocaleString()} USD</b> (${w.totalTrades} 笔成交)\n`;
-      text += `• 实盘平仓胜率: ${winRateDisplay} | 已实现盈亏: ${pnlDisplay}\n`;
-      text += `• 链上行为特征: <i>${w.strategy}</i>\n`;
+      text += `• 实盘未平仓总规模: <b>$${w.volumeUsd.toLocaleString()} USD</b> (${w.openPositionsCount} 个仓位)\n`;
+      text += `• 当前持仓总浮盈: <b>${upnlSign}$${w.unrealizedPnlUsd.toLocaleString()} USD</b>\n`;
+      text += `• 实盘综合胜率: <b>${w.winRatePercent}%</b>\n`;
+      text += `• 头号重仓明细: <i>${w.strategy}</i>\n`;
       text += `• 钱包地址: <code>${w.address}</code>\n\n`;
 
       keyboard.text(`⚡ 跟单 Top ${w.rank} (0x${w.address.slice(-4)})`, `follow_${w.id}`).row();
     });
 
     keyboard
-      .text('🔄 实时重扫链上区块', 'refresh_leaderboard')
+      .text('🔄 实时重扫主网巨鲸', 'refresh_leaderboard')
       .text('🔍 监控自定义钱包', 'track_custom_wallet')
       .row()
       .text('🔙 返回主菜单', 'back_to_menu');
@@ -331,7 +324,7 @@ ${balanceDisplay}
     const keyboard = new InlineKeyboard()
       .text('💳 充值 USDT/INJ 激活实盘', 'deposit_guide')
       .row()
-      .text('🧪 开启 $10,000 体验金演练', targetAddress ? `enable_practice_and_follow_${targetAddress}` : 'enable_practice_mode')
+      .text('🧪 开启 $10,000 体验金演练', targetAddress ? `prac_follow_${targetAddress}` : 'enable_practice_mode')
       .row()
       .text('🔙 返回主菜单', 'back_to_menu');
 
@@ -415,7 +408,7 @@ ${balanceDisplay}
     this.bot.command('stats', (ctx) => {
       const stats = this.copyEngine.getStats();
       ctx.reply(
-        `📊 <b>实时跟单战绩看板</b>\n• 累计捕获信号: <b>${stats.total} 笔</b>\n• 成功执行上链: <b>${stats.success} 笔</b>\n• 拦截异常交易: <b>${stats.total - stats.success} 笔</b>`,
+        `📊 <b>实时跟单战绩看板</b>\n• 累计捕获信号: <b>${stats.total} 笔</b>\n• 成功执行上链: <b>${stats.success} 笔</b>\n• 拦截异常交易: <b>${stats.total - stats.success} 笔</b>\n• 开发者手续费分成 (40%): 已开启 (Injective 链上协议自动分润)\n• 开发者分润接收地址: <code>${this.config.feeRecipient}</code>`,
         {
           parse_mode: 'HTML',
           reply_markup: new InlineKeyboard().text('🔙 返回主菜单', 'back_to_menu'),
@@ -423,15 +416,32 @@ ${balanceDisplay}
       );
     });
 
-    // 3. 文本输入监听 (优先检测是否为自定义 Injective 地址)
+    // 3. 文本输入监听 (区分主动等待输入与普通发送地址)
     this.bot.on('message:text', async (ctx) => {
       const text = (ctx.message.text || '').trim();
       const userId = ctx.from?.id || 0;
 
-      // 如果以 inj1 开头或者是处于等待输入状态
-      if (text.startsWith('inj1') || this.awaitingAddressUsers.has(userId)) {
+      // 只有当用户明确处于等待输入自定义钱包状态时，才直接锁定跟单目标
+      if (this.awaitingAddressUsers.has(userId)) {
         await this.handleCustomAddressInput(ctx, text);
         return;
+      }
+
+      // 如果用户没有处于等待输入状态，但发送了 inj1... 地址，弹出操作选择卡片而非强行锁定跟单
+      if (text.startsWith('inj1')) {
+        const check = validateInjectiveAddress(text);
+        if (check.valid && check.cleanAddress) {
+          const cleanAddr = check.cleanAddress;
+          const promptText = `💡 <b>检测到您发送了 Injective 链上地址：</b>\n<code>${cleanAddr}</code>\n\n请选择您要对该地址执行的操作：`;
+          const keyboard = new InlineKeyboard()
+            .text('🎯 设为我的跟单目标', `follow_custom_${cleanAddr}`)
+            .row()
+            .text('🔍 查询该地址链上资产', `inspect_addr_${cleanAddr}`)
+            .row()
+            .text('🔙 返回主菜单', 'back_to_menu');
+          await ctx.reply(promptText, { parse_mode: 'HTML', reply_markup: keyboard });
+          return;
+        }
       }
 
       // 默认通配：调出主控制台
@@ -587,8 +597,8 @@ ${balanceDisplay}
       });
     });
 
-    // 开启体验金并直接锁定某目标
-    this.bot.callbackQuery(/^enable_practice_and_follow_(.+)$/, async (ctx) => {
+    // 开启体验金并直接锁定某目标 (callback_data 长度: 12 + 42 = 54 <= 64 bytes)
+    this.bot.callbackQuery(/^prac_follow_(.+)$/, async (ctx) => {
       const userId = ctx.from?.id || 0;
       const targetAddress = ctx.match[1];
       this.walletService.setPracticeMode(userId, true);
@@ -686,10 +696,49 @@ ${balanceDisplay}
         .text(isCopying ? '⏸️ 暂停自动跟单' : '🟢 开启自动跟单', isCopying ? 'pause_copy' : 'start_copy')
         .text('💰 修改金额', 'set_amount')
         .row()
+        .text('🗑️ 清除当前跟单目标', 'clear_target')
         .text('🛡️ 风控与滑点', 'view_risk')
+        .row()
         .text('🔙 返回主菜单', 'back_to_menu');
 
       await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+    });
+
+    // 清除当前跟单目标
+    this.bot.callbackQuery('clear_target', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      this.walletService.clearUserTarget(userId);
+      await ctx.answerCallbackQuery('🗑️ 已清除当前跟单目标并停止跟单').catch(() => {});
+      await this.renderMainMenu(ctx, true);
+    });
+
+    // 查询任意 Injective 地址链上资产
+    this.bot.callbackQuery(/^inspect_addr_(.+)$/, async (ctx) => {
+      const addr = ctx.match[1];
+      await ctx.answerCallbackQuery('正在查询该地址链上余额...').catch(() => {});
+      const balances = await this.walletService.getRealBalances(addr);
+      const inspectText = `
+🔍 <b>【Injective 链上地址资产查询】</b>
+
+• <b>查询地址</b>:
+<code>${addr}</code>
+
+📊 <b>实时链上资产 (主账户 + 衍生品子账户)</b>:
+• <b>INJ 余额</b>: <code>${balances.inj} INJ</code>
+• <b>USDT/USDC 余额</b>: <code>${balances.usdt} USDT</code>
+• <b>总资产折合估值</b>: <b>~$${balances.totalUsd} USD</b>
+      `.trim();
+
+      const keyboard = new InlineKeyboard()
+        .text('🎯 设为我的跟单目标', `follow_custom_${addr}`)
+        .row()
+        .text('🔙 返回主菜单', 'back_to_menu');
+
+      try {
+        await ctx.editMessageText(inspectText, { parse_mode: 'HTML', reply_markup: keyboard });
+      } catch {
+        await ctx.reply(inspectText, { parse_mode: 'HTML', reply_markup: keyboard });
+      }
     });
 
     this.bot.callbackQuery('toggle_mode_ratio', async (ctx) => {
@@ -797,13 +846,13 @@ ${balanceDisplay}
 <code>${refLink}</code>
 
 💡 <b>推广话术推荐:</b>
-<i>“Injective 链上胜率 83% 巨鲸自动跟单，资金在自己钱包无提现风险，一键挂机带飞：${refLink}”</i>
+<i>“Injective 链上实盘聪明钱巨鲸自动跟单，资金在自己钱包无提现风险，一键挂机带飞：${refLink}”</i>
       `.trim();
 
       const keyboard = new InlineKeyboard()
         .url(
           '🚀 转发到 Telegram 群/好友',
-          `https://t.me/share/url?url=${encodeURIComponent(refLink)}&text=${encodeURIComponent('Injective 链上胜率 83% 巨鲸自动跟单神器，点此开启挂机跟单！')}`
+          `https://t.me/share/url?url=${encodeURIComponent(refLink)}&text=${encodeURIComponent('Injective 链上实盘聪明钱巨鲸自动跟单神器，点此开启挂机跟单！')}`
         )
         .row()
         .text('🔙 返回主菜单', 'back_to_menu');
@@ -824,7 +873,8 @@ ${balanceDisplay}
 • 自动跟单成功笔数: <b>${stats.success} 笔</b>
 • 风控拦截异常交易: <b>${stats.total - stats.success} 笔</b>
 • 平均链上执行延迟: <b>~380 ms (亚秒级)</b>
-• 协议手续费分成比例: <b>已开启 (捕获 40%)</b>
+• 开发者手续费分成 (40%): 已开启 (Injective 链上协议自动分润)
+• 开发者分润接收地址: <code>${this.config.feeRecipient}</code>
       `.trim();
 
       await ctx.editMessageText(text, {
@@ -893,7 +943,7 @@ ${balanceDisplay}
       await ctx.answerCallbackQuery('已成功锁定跟单目标！').catch(() => {});
     }
 
-    const winRate = whale ? `${whale.winRatePercent}%` : '80.0%+ (链上活跃)';
+    const winRate = whale && whale.winRatePercent > 0 ? `${whale.winRatePercent}%` : '链上实盘实时追踪';
     const modeBadge = isPractice ? '🧪 $10,000 体验金演练跟单' : '🔴 链上实盘扣款跟单';
     const userCopy = this.walletService.getUserCopyState(userId);
 
@@ -912,9 +962,9 @@ ${balanceDisplay}
 
     const keyboard = new InlineKeyboard()
       .text('⏸️ 暂停自动跟单', 'pause_copy')
-      .text('💰 修改单笔金额', 'set_amount')
+      .text('🗑️ 清除当前跟单目标', 'clear_target')
       .row()
-      .text('👛 查看钱包余额', 'view_wallet')
+      .text('💰 修改单笔金额', 'set_amount')
       .text('🔙 返回主菜单', 'back_to_menu');
 
     if (isCallback) {
