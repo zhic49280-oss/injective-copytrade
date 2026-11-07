@@ -4,6 +4,16 @@ import { PrivateKey, getSubaccountId, IndexerGrpcAccountPortfolioApi } from '@in
 import BigNumber from 'bignumber.js';
 import { AppConfig } from '../config/index.js';
 
+export interface PracticePosition {
+  marketTicker: string;
+  direction: 'BUY' | 'SELL';
+  entryPrice: number;
+  quantity: number;
+  marginUsdt: number;
+  leverage: number;
+  timestamp: number;
+}
+
 export interface UserWallet {
   telegramId: number;
   username?: string;
@@ -13,6 +23,8 @@ export interface UserWallet {
   createdAt: number;
   practiceMode?: boolean;
   practiceBalanceUsdt?: number;
+  practicePositions?: PracticePosition[];
+  practiceRealizedPnlUsdt?: number;
   isCopyingEnabled?: boolean;
   targetTraderAddress?: string;
   targetTraderName?: string;
@@ -52,6 +64,15 @@ export class WalletService {
             item.isCopyingEnabled = false;
             dirtyFixed = true;
           }
+          if (item.practiceBalanceUsdt === undefined) {
+            item.practiceBalanceUsdt = 10000;
+          }
+          if (!Array.isArray(item.practicePositions)) {
+            item.practicePositions = [];
+          }
+          if (item.practiceRealizedPnlUsdt === undefined) {
+            item.practiceRealizedPnlUsdt = 0;
+          }
           this.wallets.set(item.telegramId, item);
         }
         if (dirtyFixed) {
@@ -77,6 +98,13 @@ export class WalletService {
   }
 
   /**
+   * 获取所有已注册用户的钱包列表
+   */
+  public getAllWallets(): UserWallet[] {
+    return Array.from(this.wallets.values());
+  }
+
+  /**
    * 获取或自动为用户创建专属 Injective 真实链上钱包
    */
   public getOrCreateWallet(telegramId: number, username?: string): UserWallet {
@@ -97,11 +125,17 @@ export class WalletService {
         createdAt: Date.now(),
         practiceMode: false,
         practiceBalanceUsdt: 10000,
+        practicePositions: [],
+        practiceRealizedPnlUsdt: 0,
       };
 
       this.wallets.set(telegramId, wallet);
       this.saveWallets();
       console.log(`[WalletService] 🆕 为用户 @${username || telegramId} 生成真实 Injective 钱包: ${injectiveAddress}`);
+    } else {
+      if (wallet.practiceBalanceUsdt === undefined) wallet.practiceBalanceUsdt = 10000;
+      if (!Array.isArray(wallet.practicePositions)) wallet.practicePositions = [];
+      if (wallet.practiceRealizedPnlUsdt === undefined) wallet.practiceRealizedPnlUsdt = 0;
     }
     return wallet;
   }
@@ -112,8 +146,10 @@ export class WalletService {
   public setPracticeMode(telegramId: number, enabled: boolean): UserWallet {
     const wallet = this.getOrCreateWallet(telegramId);
     wallet.practiceMode = enabled;
-    if (enabled && (!wallet.practiceBalanceUsdt || wallet.practiceBalanceUsdt <= 0)) {
+    if (enabled && (wallet.practiceBalanceUsdt === undefined || wallet.practiceBalanceUsdt <= 0)) {
       wallet.practiceBalanceUsdt = 10000;
+      wallet.practicePositions = [];
+      wallet.practiceRealizedPnlUsdt = 0;
     }
     this.saveWallets();
     return wallet;
@@ -122,6 +158,72 @@ export class WalletService {
   public isPracticeMode(telegramId: number): boolean {
     const wallet = this.wallets.get(telegramId);
     return wallet ? !!wallet.practiceMode : false;
+  }
+
+  /**
+   * 执行模拟体验金交易 (真实扣减可用体验金保证金、记录模拟持仓与反向平仓结算盈亏)
+   */
+  public executePracticeTrade(
+    telegramId: number,
+    params: {
+      marketTicker: string;
+      direction: 'BUY' | 'SELL';
+      price: number;
+      quantity: number;
+      marginUsdt: number;
+      leverage: number;
+    }
+  ): { success: boolean; wallet: UserWallet; realizedPnlDelta: number; error?: string } {
+    const wallet = this.getOrCreateWallet(telegramId);
+    if (wallet.practiceBalanceUsdt === undefined) wallet.practiceBalanceUsdt = 10000;
+    if (!Array.isArray(wallet.practicePositions)) wallet.practicePositions = [];
+    if (wallet.practiceRealizedPnlUsdt === undefined) wallet.practiceRealizedPnlUsdt = 0;
+
+    let realizedPnlDelta = 0;
+    const existingIdx = wallet.practicePositions.findIndex(
+      (p) => p.marketTicker === params.marketTicker && p.direction !== params.direction
+    );
+
+    // 若存在反向持仓，先平仓结算盈亏并释放原占用保证金
+    if (existingIdx !== -1) {
+      const existing = wallet.practicePositions[existingIdx];
+      const priceDiff =
+        existing.direction === 'BUY'
+          ? params.price - existing.entryPrice
+          : existing.entryPrice - params.price;
+      const pnl = Number((priceDiff * existing.quantity).toFixed(2));
+      realizedPnlDelta = pnl;
+      wallet.practiceBalanceUsdt = Number(
+        (wallet.practiceBalanceUsdt + existing.marginUsdt + pnl).toFixed(2)
+      );
+      wallet.practiceRealizedPnlUsdt = Number((wallet.practiceRealizedPnlUsdt + pnl).toFixed(2));
+      wallet.practicePositions.splice(existingIdx, 1);
+    }
+
+    const marginToDeduct = Number(params.marginUsdt.toFixed(2));
+    if (wallet.practiceBalanceUsdt < marginToDeduct) {
+      return {
+        success: false,
+        wallet,
+        realizedPnlDelta,
+        error: `模拟体验金可用余额不足 ($${wallet.practiceBalanceUsdt.toFixed(2)} < $${marginToDeduct.toFixed(2)})`,
+      };
+    }
+
+    // 真实扣除体验金保证金并记录模拟持仓
+    wallet.practiceBalanceUsdt = Number((wallet.practiceBalanceUsdt - marginToDeduct).toFixed(2));
+    wallet.practicePositions.push({
+      marketTicker: params.marketTicker,
+      direction: params.direction,
+      entryPrice: params.price,
+      quantity: params.quantity,
+      marginUsdt: marginToDeduct,
+      leverage: params.leverage,
+      timestamp: Date.now(),
+    });
+
+    this.saveWallets();
+    return { success: true, wallet, realizedPnlDelta };
   }
 
   /**
@@ -208,6 +310,8 @@ export class WalletService {
       createdAt: Date.now(),
       practiceMode: false,
       practiceBalanceUsdt: 10000,
+      practicePositions: [],
+      practiceRealizedPnlUsdt: 0,
     };
 
     this.wallets.set(telegramId, wallet);

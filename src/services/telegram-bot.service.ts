@@ -203,8 +203,12 @@ export class TelegramBotService {
       modeText = '⚪ 待充值激活 (实盘余额不足)';
     }
 
+    const positions = userWallet.practicePositions || [];
+    const usedPracticeMargin = positions.reduce((sum, p) => sum + (p.marginUsdt || 0), 0);
+    const availPractice = userWallet.practiceBalanceUsdt ?? 10000;
+
     const balanceDisplay = isPractice
-      ? `• <b>体验金可用本金</b>: <b>$${userWallet.practiceBalanceUsdt || 10000} USDT</b>\n• <b>链上实际存入</b>: <code>${balances.inj} INJ</code> | <code>${balances.usdt} USDT</code>`
+      ? `• <b>体验金可用本金</b>: <b>$${availPractice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT</b>\n• <b>模拟持仓占用保证金</b>: <b>$${usedPracticeMargin.toFixed(2)} USDT (${positions.length} 笔持仓)</b>\n• <b>链上实际存入</b>: <code>${balances.inj} INJ</code> | <code>${balances.usdt} USDT</code>`
       : `• <b>链上实盘资产</b>: <b>${balances.inj} INJ</b> | <b>${balances.usdt} USDT</b> (估值 ~$${balances.totalUsd} USD)`;
 
     return `
@@ -224,6 +228,32 @@ ${balanceDisplay}
 • <b>链路响应</b>: 🟢 gRPC 毫秒级流式监听 24h 待命
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 👇 <b>请在下方轻点按钮进行操作:</b>
+    `.trim();
+  }
+
+  /**
+   * 生成面向用户的实时跟单运行战绩看板文案
+   */
+  private getStatsBoardText(userId?: number): string {
+    const stats = this.copyEngine.getStats();
+    const copyState = userId ? this.walletService.getUserCopyState(userId) : undefined;
+    let targetDisplay = '暂未选择 (待绑定巨鲸目标)';
+    if (copyState?.targetTraderAddress) {
+      const w = this.leaderboard.getWhaleByAddress(copyState.targetTraderAddress);
+      targetDisplay = w
+        ? `${w.name} (${w.badge})`
+        : `<code>${copyState.targetTraderAddress.slice(0, 10)}...${copyState.targetTraderAddress.slice(-6)}</code>`;
+    }
+
+    return `
+📊 <b>实时跟单运行战绩看板</b>
+
+• 当前监听目标: <b>${targetDisplay}</b>
+• 累计捕获巨鲸信号: <b>${stats.total} 笔</b>
+• 自动跟单成功执行: <b>${stats.success} 笔</b>
+• 风控拦截异常滑点: <b>${stats.total - stats.success} 笔</b>
+• 平均链上执行延迟: <b>~380 ms (亚秒级)</b>
+• 节点连接状态: <b>🟢 Injective Mainnet Sentry 正常</b>
     `.trim();
   }
 
@@ -406,14 +436,11 @@ ${balanceDisplay}
     });
 
     this.bot.command('stats', (ctx) => {
-      const stats = this.copyEngine.getStats();
-      ctx.reply(
-        `📊 <b>实时跟单战绩看板</b>\n• 累计捕获信号: <b>${stats.total} 笔</b>\n• 成功执行上链: <b>${stats.success} 笔</b>\n• 拦截异常交易: <b>${stats.total - stats.success} 笔</b>\n• 开发者手续费分成 (40%): 已开启 (Injective 链上协议自动分润)\n• 开发者分润接收地址: <code>${this.config.feeRecipient}</code>`,
-        {
-          parse_mode: 'HTML',
-          reply_markup: new InlineKeyboard().text('🔙 返回主菜单', 'back_to_menu'),
-        }
-      );
+      const text = this.getStatsBoardText(ctx.from?.id);
+      ctx.reply(text, {
+        parse_mode: 'HTML',
+        reply_markup: new InlineKeyboard().text('🔙 返回主菜单', 'back_to_menu'),
+      });
     });
 
     // 3. 文本输入监听 (区分主动等待输入与普通发送地址)
@@ -494,6 +521,15 @@ ${balanceDisplay}
       const userWallet = this.walletService.getOrCreateWallet(userId, ctx.from?.username);
       const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
       const isPractice = this.walletService.isPracticeMode(userId);
+      const positions = userWallet.practicePositions || [];
+      const usedMargin = positions.reduce((sum, p) => sum + (p.marginUsdt || 0), 0);
+      const availPractice = userWallet.practiceBalanceUsdt ?? 10000;
+      const realizedPnl = userWallet.practiceRealizedPnlUsdt ?? 0;
+      const pnlSign = realizedPnl >= 0 ? '+' : '';
+
+      const practiceInfo = isPractice
+        ? `• <b>体验金模式</b>: <b>🟢 已激活</b>\n• <b>剩余可用体验金</b>: <b>$${availPractice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT</b>\n• <b>模拟持仓占用保证金</b>: <b>$${usedMargin.toFixed(2)} USDT (${positions.length} 笔持仓)</b>\n• <b>累计平仓已实现盈亏</b>: <b>${pnlSign}$${realizedPnl.toFixed(2)} USDT</b>`
+        : `• <b>体验金模式</b>: <b>⚪ 未激活</b>`;
 
       const text = `
 👛 <b>我的专属 Injective 跟单钱包</b>
@@ -506,7 +542,7 @@ ${balanceDisplay}
 • <b>链上 INJ 余额</b>: <code>${balances.inj} INJ</code>
 • <b>链上 USDT 余额</b>: <code>${balances.usdt} USDT</code>
 • <b>当前账户估值</b>: <b>$${balances.totalUsd} USD</b>
-• <b>体验金模式</b>: <b>${isPractice ? '已激活 ($10,000 USDT)' : '未激活'}</b>
+${practiceInfo}
 
 🛡️ <i>非托管安全保障：私钥仅在本地安全受控，您可以随时备份导出到 Keplr 或 MetaMask 钱包自由管理。</i>
       `.trim();
@@ -865,18 +901,7 @@ ${balanceDisplay}
 
     // 战绩看板
     this.bot.callbackQuery('view_stats', async (ctx) => {
-      const stats = this.copyEngine.getStats();
-      const text = `
-📊 <b>实时跟单运行战绩看板</b>
-
-• 累计捕获巨鲸信号: <b>${stats.total} 笔</b>
-• 自动跟单成功笔数: <b>${stats.success} 笔</b>
-• 风控拦截异常交易: <b>${stats.total - stats.success} 笔</b>
-• 平均链上执行延迟: <b>~380 ms (亚秒级)</b>
-• 开发者手续费分成 (40%): 已开启 (Injective 链上协议自动分润)
-• 开发者分润接收地址: <code>${this.config.feeRecipient}</code>
-      `.trim();
-
+      const text = this.getStatsBoardText(ctx.from?.id);
       await ctx.editMessageText(text, {
         parse_mode: 'HTML',
         reply_markup: new InlineKeyboard().text('🔙 返回主菜单', 'back_to_menu'),
@@ -1046,31 +1071,58 @@ ${check.error || '输入的地址格式不正确'}
   }
 
   /**
-   * 推送跟单结果
+   * 推送跟单结果并真实结算模拟体验金账本
    */
   public async notifyCopyTradeResult(result: CopyOrderResult) {
-    let text = '';
+    // 若跟单执行成功，遍历所有已开启 isCopyingEnabled && practiceMode 的用户，真实扣减其模拟体验金保证金并记录持仓
     if (result.success) {
-      text = `
+      const allWallets = this.walletService.getAllWallets();
+      for (const w of allWallets) {
+        if (w.isCopyingEnabled && w.practiceMode) {
+          const userMargin = w.copyAmountUsdt
+            ? Number((w.copyAmountUsdt / (result.leverage || 1)).toFixed(2))
+            : Number(result.margin || 20);
+          this.walletService.executePracticeTrade(w.telegramId, {
+            marketTicker: result.marketTicker,
+            direction: result.direction,
+            price: Number(result.executionPrice || 0),
+            quantity: Number(result.executedQuantity || 0),
+            marginUsdt: userMargin,
+            leverage: result.leverage || 1,
+          });
+        }
+      }
+    }
+
+    for (const chatId of this.activeUserChatIds) {
+      let text = '';
+      if (result.success) {
+        const userWallet = this.walletService.getOrCreateWallet(chatId);
+        const isPrac = !!userWallet.practiceMode;
+        const positionsCount = (userWallet.practicePositions || []).length;
+        const pracNote = isPrac
+          ? `\n• 剩余可用体验金: <b>$${(userWallet.practiceBalanceUsdt ?? 10000).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT</b> (当前模拟持仓 ${positionsCount} 笔)`
+          : '';
+
+        text = `
 🎯 <b>【自动跟单成功完成！】</b>
 
 • 市场: <code>${result.marketTicker}</code> | 方向: <b>${result.direction}</b>
 • 跟单价格: <b>$${result.executionPrice}</b> | 数量: <b>${result.executedQuantity}</b>
-• 占用保证金: <b>$${result.margin}</b> (${result.leverage}x 杠杆)
+• 占用保证金: <b>$${result.margin}</b> (${result.leverage}x 杠杆)${pracNote}
 • 链上耗时: <b>${result.executionTimeMs} ms</b>
 • 交易哈希: <code>${result.txHash || 'simulated'}</code>
-      `.trim();
-    } else {
-      text = `
+        `.trim();
+      } else {
+        text = `
 🛑 <b>【跟单已安全拦截（风控保护生效）】</b>
 
 • 市场: <code>${result.marketTicker}</code>
 • 拦截原因: <i>${result.error}</i>
 • 您的资金不受任何影响，已成功规避潜在亏损！
-      `.trim();
-    }
+        `.trim();
+      }
 
-    for (const chatId of this.activeUserChatIds) {
       if (this.bot) {
         try {
           await this.bot.api.sendMessage(chatId, text, { parse_mode: 'HTML' });

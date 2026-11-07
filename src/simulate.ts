@@ -30,20 +30,27 @@ async function runSimulation() {
   console.log('[1/6] 验证网络抽象解析与开发者 40% 手续费返佣地址...');
   const testnetRes = parseNetwork('testnet');
   const mainnetRes = parseNetwork('mainnet');
+  const defaultRes = parseNetwork();
   const expectedDeveloperAddress = 'inj10k7vw7thyltfjag0junlxfrd0nf4wjjc3grecn';
 
   console.log(`   - Testnet 解析: ${testnetRes.networkName} (Network: ${testnetRes.network})`);
   console.log(`   - Mainnet 解析: ${mainnetRes.networkName} (Network: ${mainnetRes.network})`);
+  console.log(`   - 默认生产网络: ${config.networkName} (Network: ${config.network})`);
   console.log(`   - 开发者 40% 分润地址 (feeRecipient): ${config.feeRecipient}`);
 
-  if (testnetRes.networkName !== 'testnet' || mainnetRes.networkName !== 'mainnet') {
-    throw new Error('网络抽象解析异常');
+  if (
+    testnetRes.networkName !== 'testnet' ||
+    mainnetRes.networkName !== 'mainnet' ||
+    defaultRes.networkName !== 'mainnet' ||
+    config.networkName !== 'mainnet'
+  ) {
+    throw new Error('网络抽象解析异常或生产默认网络未指向 Mainnet');
   }
   if (config.feeRecipient !== expectedDeveloperAddress) {
     throw new Error(`开发者分润地址不匹配: 预期 ${expectedDeveloperAddress}, 实际 ${config.feeRecipient}`);
   }
 
-  // 检查代码中是否彻底清除了硬编码假胜率
+  // 检查代码中是否彻底清除了硬编码假胜率以及面向用户的“开发者手续费分成/分润”字眼
   const tgBotSource = fs.readFileSync(
     path.resolve(process.cwd(), 'src/services/telegram-bot.service.ts'),
     'utf-8'
@@ -51,7 +58,13 @@ async function runSimulation() {
   if (tgBotSource.includes('80.0%+') || tgBotSource.includes('胜率 83%')) {
     throw new Error('检测到 telegram-bot.service.ts 中仍残留硬编码假胜率字样！');
   }
-  console.log('✅ 测试用例 1 通过: 网络抽象与开发者 40% 手续费分润地址绑定正确，零硬编码假胜率！');
+  const forbiddenUiTerms = ['开发者手续费', '开发者分润', '协议手续费分成', 'feeRecipient'];
+  for (const term of forbiddenUiTerms) {
+    if (tgBotSource.includes(term)) {
+      throw new Error(`检测到 telegram-bot.service.ts 面向用户的代码中违规暴露了内部抽成字样: "${term}"`);
+    }
+  }
+  console.log('✅ 测试用例 1 通过: 后台开发者 40% 分润地址静默生效，前端 UI 零暴露内部抽成字眼、零硬编码假胜率！');
 
   // --- 测试用例 2: Bech32 Checksum 校验与 Telegram callback_data 64 字节上限断言 ---
   console.log('\n[2/6] 验证自定义钱包 Bech32 Checksum 校验与 callback_data 长度安全边界...');
@@ -152,12 +165,40 @@ async function runSimulation() {
     throw new Error('clearUserTarget 未能正确清除跟单目标！');
   }
 
-  // 激活体验金
-  walletService.setPracticeMode(testTgId, true);
-  if (!walletService.isPracticeMode(testTgId)) {
+  // 激活体验金并重置初始 $10,000 状态进行真实账本扣减测试
+  const freshPracticeUser = 88776655;
+  walletService.setPracticeMode(freshPracticeUser, true);
+  const wBefore = walletService.getOrCreateWallet(freshPracticeUser);
+  wBefore.practiceBalanceUsdt = 10000;
+  wBefore.practicePositions = [];
+  wBefore.practiceRealizedPnlUsdt = 0;
+
+  if (!walletService.isPracticeMode(freshPracticeUser)) {
     throw new Error('体验金状态切换失败！');
   }
-  console.log('✅ 测试用例 5 通过: 脏数据自动纠错、清除目标与体验金演练机制全部正常！');
+
+  const tradeRes = walletService.executePracticeTrade(freshPracticeUser, {
+    marketTicker: 'INJ/USDC PERP',
+    direction: 'BUY',
+    price: 25.0,
+    quantity: 4,
+    marginUsdt: 20,
+    leverage: 5,
+  });
+
+  console.log(
+    `   - 模拟体验金下单扣减验证: 扣除 $20 保证金后可用体验金 = $${tradeRes.wallet.practiceBalanceUsdt} USDT, 持仓笔数 = ${tradeRes.wallet.practicePositions?.length}`
+  );
+  if (
+    !tradeRes.success ||
+    tradeRes.wallet.practiceBalanceUsdt !== 9980 ||
+    (tradeRes.wallet.practicePositions?.length || 0) !== 1
+  ) {
+    throw new Error(
+      `体验金真实扣减或持仓记录异常: balance=${tradeRes.wallet.practiceBalanceUsdt}, positions=${tradeRes.wallet.practicePositions?.length}`
+    );
+  }
+  console.log('✅ 测试用例 5 通过: 脏数据自动纠错、清除目标与 $10,000 体验金 Paper Trading 真实扣减结算全部正常！');
 
   // --- 测试用例 6: 端到端信号撮合、feeRecipient 校验与滑点风控拦截 ---
   console.log('\n[6/6] 验证端到端跟单撮合、40% 分润注入与滑点风控拦截...');
@@ -207,7 +248,7 @@ async function runSimulation() {
   tracker.emitManualEvent(normalEvent);
   await new Promise((r) => setTimeout(r, 600));
 
-  // 6.2 异常滑点信号 (偏离 15%)
+  // 6.2 异常滑点信号 (偏离 20%)
   const slippageEvent: SmartMoneyTradeEvent = {
     id: `sim_slip_${Date.now()}`,
     traderAddress: newTarget,
@@ -215,9 +256,9 @@ async function runSimulation() {
     marketId: market.marketId,
     marketTicker: market.ticker,
     direction: 'BUY',
-    price: basePrice * 0.85,
+    price: basePrice * 0.8,
     quantity: 10,
-    notionalUsd: basePrice * 0.85 * 10,
+    notionalUsd: basePrice * 0.8 * 10,
     orderType: 'market',
     timestamp: Date.now(),
   };

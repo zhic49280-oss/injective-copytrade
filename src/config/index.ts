@@ -32,19 +32,23 @@ export interface AppConfig {
 }
 
 export function parseNetwork(netStr?: string): { network: Network; networkName: 'mainnet' | 'testnet' } {
-  const clean = (netStr || process.env.NETWORK || 'testnet').trim().toLowerCase();
-  if (clean === 'mainnet' || clean === 'main' || clean === 'mainnet-k8s') {
-    return { network: Network.Mainnet, networkName: 'mainnet' };
+  const clean = (netStr || 'mainnet').trim().toLowerCase();
+  if (clean === 'testnet') {
+    return { network: Network.TestnetSentry, networkName: 'testnet' };
   }
-  return { network: Network.Testnet, networkName: 'testnet' };
+  return { network: Network.MainnetSentry, networkName: 'mainnet' };
 }
 
-const resolvedNetwork = parseNetwork(process.env.NETWORK);
+// 生产环境强制默认使用 Injective Mainnet (忽略旧 .env 遗留的 NETWORK=testnet，仅当显式设置 FORCE_TESTNET=true 时才回退测试网)
+const resolvedNetwork =
+  process.env.FORCE_TESTNET === 'true'
+    ? parseNetwork('testnet')
+    : parseNetwork('mainnet');
 
-// 默认已验证活跃聪明钱地址 (Testnet 与 Mainnet)
+// 默认已验证活跃聪明钱地址 (Mainnet 与 Testnet)
 const DEFAULT_TARGET_ADDRESS =
   resolvedNetwork.networkName === 'mainnet'
-    ? 'inj1xah26mtc37j3rt5rd3u8heg07rhvhjr64l9u5g'
+    ? 'inj1nzy6v4umemnkvucy7wgprh6mlwskexzdgkppp4'
     : 'inj1zd8e0mh95hle4l5y2n8ts94pkkzq25vg8aj0xp';
 
 export const config: AppConfig = {
