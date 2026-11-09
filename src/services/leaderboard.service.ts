@@ -186,9 +186,16 @@ export class LeaderboardService {
         whaleMap.set(addr, cur);
       }
 
-      // 筛选出 totalUnrealizedPnlUsd > 50 && totalNotionalUsd >= 500 的前 25 名候选巨鲸
+      // 筛选出真正高浮盈且有实盘规模的链上巨鲸，排除总仓位很多但平均单仓极小的散户刷单机器人
       const topCandidates = Array.from(whaleMap.values())
-        .filter((w) => w.totalUnrealizedPnlUsd > 50 && w.totalNotionalUsd >= 500)
+        .filter((w) => {
+          const avgPosSize = w.openPosCount > 0 ? w.totalNotionalUsd / w.openPosCount : 0;
+          return (
+            w.totalUnrealizedPnlUsd > 50 &&
+            w.totalNotionalUsd >= 500 &&
+            (w.openPosCount <= 20 || avgPosSize >= 200 || w.totalNotionalUsd >= 50000)
+          );
+        })
         .sort((a, b) => b.totalUnrealizedPnlUsd - a.totalUnrealizedPnlUsd)
         .slice(0, 25);
 

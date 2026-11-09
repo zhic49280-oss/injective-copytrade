@@ -368,7 +368,15 @@ ${balanceDisplay}
       ? '🧪 模拟盘演练 (虚拟体验金毫秒撮合，不上链不耗 Gas)'
       : '🔴 实盘链上交易 (专属钱包私钥真实签名上链)';
 
-    const text = `
+    const maxDisplay = 5;
+    const displayedPositions = positionLines.slice(0, maxDisplay);
+    let positionsBlock =
+      displayedPositions.length > 0 ? displayedPositions.join('\n\n') : '  ⚪ 暂无活动持仓 (等待巨鲸开仓触发)';
+    if (positions.length > maxDisplay) {
+      positionsBlock += `\n\n<i>... 另外还有 ${positions.length - maxDisplay} 笔持仓已为您按标的自动汇总净值与浮盈，轻点下方【⚡ 一键市价全平】可全部结算</i>`;
+    }
+
+    let text = `
 📊 <b>【跟单账户实时资产与盈亏战绩看板】</b>
 
 • <b>执行引擎模式</b>: <b>${execModeDesc}</b>
@@ -384,7 +392,7 @@ ${balanceDisplay}
 • <b>平仓胜率 (Win Rate)</b>: <b>${winRate}%</b> (${pStats.winTrades}胜 / ${pStats.lossTrades}负)
 
 📈 <b>当前正在运行中的持仓 (${positions.length} 笔):</b>
-${positions.length > 0 ? positionLines.join('\n\n') : '  ⚪ 暂无活动持仓 (等待巨鲸开仓触发)'}
+${positionsBlock}
 
 📜 <b>最近平仓交割记录:</b>
 ${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记录'}
@@ -393,6 +401,10 @@ ${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记�
 • 累计捕获信号: <b>${engineStats.total} 笔</b> | 放行跟单: <b>${engineStats.success} 笔</b> | 风控拦截: <b>${engineStats.total - engineStats.success} 笔</b>
 • 执行延迟: <b>~380 ms</b> | 节点: <b>🟢 Injective Mainnet Sentry</b>
     `.trim();
+
+    if (text.length > 3800) {
+      text = text.slice(0, 3750) + '\n\n<i>(持仓数较多，已自动精简展示)</i>';
+    }
 
     const keyboard = new InlineKeyboard().text('🔄 刷新实时浮盈与现价', 'view_stats').row();
 
@@ -411,10 +423,28 @@ ${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记�
         await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
         return;
       } catch (err: any) {
-        // 编辑失败降级回复
+        console.warn('[TelegramBot] editMessageText 失败，尝试以普通消息回复:', err.message);
       }
     }
-    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard });
+
+    try {
+      await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard });
+    } catch (err: any) {
+      console.error('[TelegramBot] renderPortfolioAndStats 发送失败，发送极简兜底卡片:', err.message);
+      const briefText = `
+📊 <b>【跟单账户实时资产概览】</b>
+
+• 账户总净值: <b>$${totalEquity.toFixed(2)} USDT</b>
+• 剩余可用体验金: <b>$${availBalance.toFixed(2)} USDT</b>
+• 持仓占用保证金: <b>$${totalUsedMargin.toFixed(2)} USDT (${positions.length} 笔持仓)</b>
+• 实时未平仓浮盈: <b>${uSign}$${totalUnrealizedPnlUsdt.toFixed(2)} USDT</b>
+• 累计已实现盈亏: <b>${rSign}$${realizedPnl.toFixed(2)} USDT</b>
+• 综合总收益率: <b>${roiSign}${totalRoi}%</b>
+
+💡 <i>当前持仓较多 (${positions.length} 笔)，建议轻点下方按钮【⚡ 一键市价全平】结算持仓，或【🔄 重置 $10,000 体验金】。</i>
+      `.trim();
+      await ctx.reply(briefText, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
+    }
   }
 
   /**

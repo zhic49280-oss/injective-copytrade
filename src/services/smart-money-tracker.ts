@@ -291,11 +291,17 @@ export class SmartMoneyTracker extends EventEmitter {
     const rawDir = (rawTrade.tradeDirection || rawTrade.orderSide || '').toLowerCase();
     const direction: TradeDirection = rawDir.includes('buy') ? 'BUY' : 'SELL';
 
-    const rawPrice = parseFloat(rawTrade.executionPrice || rawTrade.price || '0');
-    // 若原始价格大于 1000 且 decimals 为 6，通常是带精度的整数值，转换为真实单价
-    const price = rawPrice > 10000 ? rawPrice / divisor : rawPrice;
+    // Injective 链上成交 executionPrice 是以 10^decimals 缩放的整数字符串 (例如 BRETT 0.003645 是 "3645")
+    const price = rawTrade.executionPrice
+      ? parseFloat(rawTrade.executionPrice) / divisor
+      : parseFloat(rawTrade.price || '0');
     const quantity = parseFloat(rawTrade.executionQuantity || rawTrade.quantity || '0');
     const notionalUsd = price * quantity;
+
+    // 2. 严格过滤碎单与微额自动化调仓：单笔名义金额低于 $30 USD 的视为噪声直接跳过 (杜绝跟随 $1.42 等碎单)
+    if (notionalUsd < 30) {
+      return;
+    }
 
     const subId = (rawTrade.subaccountId || this.injectiveService.targetSubaccountId || '').toLowerCase();
 
