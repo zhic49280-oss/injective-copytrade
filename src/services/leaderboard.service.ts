@@ -186,19 +186,19 @@ export class LeaderboardService {
         whaleMap.set(addr, cur);
       }
 
-      // 筛选出 totalUnrealizedPnlUsd > 50 && totalNotionalUsd >= 500 的前 15 名候选巨鲸
+      // 筛选出 totalUnrealizedPnlUsd > 50 && totalNotionalUsd >= 500 的前 25 名候选巨鲸
       const topCandidates = Array.from(whaleMap.values())
         .filter((w) => w.totalUnrealizedPnlUsd > 50 && w.totalNotionalUsd >= 500)
         .sort((a, b) => b.totalUnrealizedPnlUsd - a.totalUnrealizedPnlUsd)
-        .slice(0, 15);
+        .slice(0, 25);
 
-      // 2. 并发查询这 15 名候选巨鲸子账户的最新交易记录 (limit: 30)
+      // 2. 并发查询候选巨鲸子账户的最新交易记录 (limit: 50)
       const tradeDetails = await Promise.all(
         topCandidates.map((cand) =>
           this.mainnetApi
             .fetchTrades({
               subaccountId: cand.subaccountId,
-              pagination: { limit: 30 },
+              pagination: { limit: 50 },
             })
             .then((r) => r.trades || [])
             .catch(() => [] as any[])
@@ -210,6 +210,7 @@ export class LeaderboardService {
         trades: any[];
         lastTradeMinutesAgo: number;
         lastTradeTimestamp: number;
+        isHftOrMakerBot: boolean;
       }> = [];
 
       const now = Date.now();
@@ -217,11 +218,20 @@ export class LeaderboardService {
         const cand = topCandidates[i];
         const trades = tradeDetails[i] || [];
         let lastTradeTimestamp = 0;
+        let recent1hTrades = 0;
+        let makerFills = 0;
+
         for (const t of trades) {
           const rawTs = Number(t.executedAt || 0);
           const ts = rawTs > 0 && rawTs < 1e12 ? rawTs * 1000 : rawTs;
           if (ts > lastTradeTimestamp) {
             lastTradeTimestamp = ts;
+          }
+          if (ts > 0 && now - ts <= 3600_000) {
+            recent1hTrades += 1;
+          }
+          if ((t.executionSide || '').toLowerCase() === 'maker') {
+            makerFills += 1;
           }
         }
         const lastTradeMinutesAgo =
@@ -229,24 +239,37 @@ export class LeaderboardService {
             ? Math.max(0, Math.round((now - lastTradeTimestamp) / 60000))
             : 999999;
 
+        // 识别极端高频对敲/洗量机器人: 近 1 小时成交 > 60 笔 (每分钟都开平仓)
+        const isHftOrMakerBot = recent1hTrades > 60;
+
         evaluatedCandidates.push({
           cand,
           trades,
           lastTradeMinutesAgo,
           lastTradeTimestamp,
+          isHftOrMakerBot,
         });
       }
 
-      // 严格剔除僵尸死仓：优先筛选 24 小时内 (lastTradeMinutesAgo <= 1440) 有真实交易动作的活跃盈利巨鲸
-      const active24h = evaluatedCandidates
+      // 优先筛选非极高频刷量机器人的真实巨鲸；若不足 5 名则使用全部候选池
+      const directionalCandidates = evaluatedCandidates.filter((item) => !item.isHftOrMakerBot);
+      const pool = directionalCandidates.length >= 5 ? directionalCandidates : evaluatedCandidates;
+
+      // 严格剔除 7 天以上的僵尸死仓：优先筛选 24 小时内 (lastTradeMinutesAgo <= 1440) 的活跃盈利巨鲸
+      const active24h = pool
         .filter((item) => item.lastTradeMinutesAgo <= 1440)
         .sort((a, b) => b.cand.totalUnrealizedPnlUsd - a.cand.totalUnrealizedPnlUsd);
 
-      const fallbackRecent = evaluatedCandidates
-        .filter((item) => item.lastTradeMinutesAgo > 1440)
+      const fallbackRecent = pool
+        .filter((item) => item.lastTradeMinutesAgo > 1440 && item.lastTradeMinutesAgo <= 10080)
         .sort((a, b) => a.lastTradeMinutesAgo - b.lastTradeMinutesAgo);
 
-      const selectedTop5 = [...active24h, ...fallbackRecent].slice(0, 5);
+      // 若近期活跃巨鲸不足 5 名，再从更长周期的候选人中补充，但优先保证近期活跃
+      const emergencyFallback = pool
+        .filter((item) => item.lastTradeMinutesAgo > 10080)
+        .sort((a, b) => a.lastTradeMinutesAgo - b.lastTradeMinutesAgo);
+
+      const selectedTop5 = [...active24h, ...fallbackRecent, ...emergencyFallback].slice(0, 5);
       const finalWhales: WhaleProfile[] = [];
 
       for (let i = 0; i < selectedTop5.length; i++) {

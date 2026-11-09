@@ -11,6 +11,7 @@ export class SmartMoneyTracker extends EventEmitter {
   private pollTimer?: NodeJS.Timeout;
   private processedTradeIds: Set<string> = new Set();
   private streamSubscriptions: Map<string, any> = new Map();
+  private lastSignalMeta: Map<string, { time: number; direction: string }> = new Map();
   public trackedAddresses: Set<string> = new Set();
   public trackedSubaccounts: Map<string, string> = new Map();
 
@@ -263,7 +264,7 @@ export class SmartMoneyTracker extends EventEmitter {
   }
 
   /**
-   * 处理解析单条成交数据并触发事件 (支持精确还原多巨鲸中的具体触发者地址)
+   * 处理解析单条成交数据并触发事件 (支持精确还原多巨鲸中的具体触发者地址，过滤被动挂单 Maker 与 HFT 刷单)
    */
   public handleRawTrade(rawTrade: any, fallbackTraderAddress?: string) {
     if (!rawTrade) return;
@@ -274,6 +275,12 @@ export class SmartMoneyTracker extends EventEmitter {
     }
 
     this.processedTradeIds.add(tradeId);
+
+    // 1. 过滤被动挂单 (Maker) 成交，仅跟随主动吃单 (Taker) 趋势信号
+    const execSide = (rawTrade.executionSide || '').toLowerCase();
+    if (execSide && execSide !== 'taker') {
+      return;
+    }
 
     // 解析市场信息
     const market = this.injectiveService.getMarket(rawTrade.marketId);
@@ -291,6 +298,24 @@ export class SmartMoneyTracker extends EventEmitter {
     const notionalUsd = price * quantity;
 
     const subId = (rawTrade.subaccountId || this.injectiveService.targetSubaccountId || '').toLowerCase();
+
+    // 2. 子账户 + 市场级冷却与高频双向刷单 (HFT Wash-Trading) 过滤
+    const signalKey = `${subId}_${rawTrade.marketId}`;
+    const nowMs = Date.now();
+    const prevMeta = this.lastSignalMeta.get(signalKey);
+    if (prevMeta) {
+      const elapsedMs = nowMs - prevMeta.time;
+      // 同方向 30 秒冷却，防止单笔大单被拆分成多笔小 fill 时在 1 分钟内连续重复下单
+      if (prevMeta.direction === direction && elapsedMs < 30_000) {
+        return;
+      }
+      // 45 秒内反向翻转 (BUY <-> SELL) 且单笔规模 < $5,000，判定为 HFT 网格高频刷单并跳过
+      if (prevMeta.direction !== direction && elapsedMs < 45_000 && notionalUsd < 5000) {
+        return;
+      }
+    }
+    this.lastSignalMeta.set(signalKey, { time: nowMs, direction });
+
     let resolvedTrader =
       this.trackedSubaccounts.get(subId) ||
       fallbackTraderAddress ||

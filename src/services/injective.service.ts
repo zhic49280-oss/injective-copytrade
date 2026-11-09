@@ -156,6 +156,23 @@ export class InjectiveService {
   }
 
   /**
+   * 获取市场当前最佳买卖价格 (支持传入 marketId 或 marketTicker)
+   */
+  public async getOrderbook(
+    marketIdOrTicker: string,
+    fallbackTicker?: string
+  ): Promise<{ bestBid: number; bestAsk: number; midPrice: number }> {
+    let targetMarketId = marketIdOrTicker;
+    if (!targetMarketId.startsWith('0x')) {
+      const byTicker = this.getMarketByTicker(targetMarketId) || (fallbackTicker ? this.getMarketByTicker(fallbackTicker) : undefined);
+      if (byTicker) {
+        targetMarketId = byTicker.marketId;
+      }
+    }
+    return this.getOrderbookPrices(targetMarketId);
+  }
+
+  /**
    * 获取市场当前最佳买卖价格
    */
   public async getOrderbookPrices(marketId: string): Promise<{ bestBid: number; bestAsk: number; midPrice: number }> {

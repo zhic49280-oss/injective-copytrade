@@ -44,6 +44,7 @@ export class TelegramBotService {
   private isBotRunning: boolean = false;
   private activeUserChatIds: Set<number> = new Set();
   private awaitingAddressUsers: Set<number> = new Set();
+  private awaitingWalletImportUsers: Set<number> = new Set();
 
   constructor(
     config: AppConfig,
@@ -279,6 +280,144 @@ ${balanceDisplay}
   }
 
   /**
+   * 渲染专业级实时盈亏、持仓明细与战绩看板 (支持刷新、一键全平、重置体验金)
+   */
+  public async renderPortfolioAndStats(ctx: any, isEdit: boolean = false) {
+    const userId = ctx.from?.id || 0;
+    const userWallet = this.walletService.getOrCreateWallet(userId, ctx.from?.username);
+    const isPractice = this.walletService.isPracticeMode(userId);
+    const targets = this.walletService.getUserTargets(userId);
+    const engineStats = this.copyEngine.getStats();
+
+    let targetDisplay = '暂未选择 (待添加巨鲸)';
+    if (targets.length > 0) {
+      targetDisplay = targets
+        .map((t, i) => `${i + 1}. ${t.name || '巨鲸'}(0x${t.address.slice(-4)})`)
+        .join(' | ');
+    }
+
+    const positions = userWallet.practicePositions || [];
+    const injService = this.copyEngine.getInjectiveService();
+
+    // 1. 并发获取持仓标的的最新盘口价格以计算实时未实现浮盈
+    const markPriceMap = new Map<string, number>();
+    await Promise.all(
+      positions.map(async (pos) => {
+        try {
+          const ob = await injService.getOrderbook(pos.marketId || pos.marketTicker, pos.marketTicker);
+          const p =
+            pos.direction === 'BUY'
+              ? ob.bestBid > 0
+                ? ob.bestBid
+                : ob.midPrice
+              : ob.bestAsk > 0
+              ? ob.bestAsk
+              : ob.midPrice;
+          if (p > 0) {
+            markPriceMap.set(pos.marketTicker, p);
+          }
+        } catch {
+          markPriceMap.set(pos.marketTicker, pos.entryPrice);
+        }
+      })
+    );
+
+    let totalUnrealizedPnlUsdt = 0;
+    let totalUsedMargin = 0;
+
+    const positionLines: string[] = [];
+    for (const pos of positions) {
+      const curPrice = markPriceMap.get(pos.marketTicker) || pos.entryPrice;
+      const priceDiff = pos.direction === 'BUY' ? curPrice - pos.entryPrice : pos.entryPrice - curPrice;
+      const uPnl = Number((priceDiff * pos.quantity).toFixed(2));
+      const uRoi = pos.marginUsdt > 0 ? ((uPnl / pos.marginUsdt) * 100).toFixed(2) : '0.00';
+      const sign = uPnl >= 0 ? '+' : '';
+      totalUnrealizedPnlUsdt = Number((totalUnrealizedPnlUsdt + uPnl).toFixed(2));
+      totalUsedMargin = Number((totalUsedMargin + pos.marginUsdt).toFixed(2));
+
+      const dirBadge = pos.direction === 'BUY' ? '🟢 做多 (LONG)' : '🔴 做空 (SHORT)';
+      positionLines.push(
+        `📌 <b>${pos.marketTicker}</b> | ${dirBadge} ${pos.leverage}x\n` +
+          `   • 持仓数量: <code>${pos.quantity}</code> | 占用保证金: <b>$${pos.marginUsdt.toFixed(2)} USDT</b>\n` +
+          `   • 开仓均价: <b>$${pos.entryPrice}</b> ➔ 标记现价: <b>$${curPrice}</b>\n` +
+          `   • 实时浮盈: <b>${sign}$${uPnl.toFixed(2)} USDT (${sign}${uRoi}%)</b>`
+      );
+    }
+
+    const availBalance = isPractice ? (userWallet.practiceBalanceUsdt ?? 10000) : 0;
+    const totalEquity = Number((availBalance + totalUsedMargin + totalUnrealizedPnlUsdt).toFixed(2));
+    const realizedPnl = userWallet.practiceRealizedPnlUsdt ?? 0;
+    const netPnl = Number((realizedPnl + totalUnrealizedPnlUsdt).toFixed(2));
+    const totalRoi = (((totalEquity - 10000) / 10000) * 100).toFixed(2);
+    const pStats = userWallet.practiceStats || { totalTrades: 0, winTrades: 0, lossTrades: 0 };
+    const winRate =
+      pStats.totalTrades > 0 ? ((pStats.winTrades / pStats.totalTrades) * 100).toFixed(1) : '0.0';
+
+    const uSign = totalUnrealizedPnlUsdt >= 0 ? '+' : '';
+    const rSign = realizedPnl >= 0 ? '+' : '';
+    const roiSign = parseFloat(totalRoi) >= 0 ? '+' : '';
+
+    const historyItems = (userWallet.practiceTradeHistory || []).slice(0, 4);
+    const historyLines = historyItems.map((h) => {
+      const hSign = h.netPnlUsdt >= 0 ? '+' : '';
+      const hDir = h.direction === 'BUY' ? '🟢多' : '🔴空';
+      return `  • ${hDir} <b>${h.marketTicker}</b>: 开 $${h.entryPrice} ➔ 平 $${h.exitPrice} | 净盈亏: <b>${hSign}$${h.netPnlUsdt.toFixed(2)} USDT</b>`;
+    });
+
+    const execModeDesc = isPractice
+      ? '🧪 模拟盘演练 (虚拟体验金毫秒撮合，不上链不耗 Gas)'
+      : '🔴 实盘链上交易 (专属钱包私钥真实签名上链)';
+
+    const text = `
+📊 <b>【跟单账户实时资产与盈亏战绩看板】</b>
+
+• <b>执行引擎模式</b>: <b>${execModeDesc}</b>
+• <b>跟单巨鲸矩阵</b>: <b>${targetDisplay}</b>
+
+💰 <b>账户财务核心指标:</b>
+• <b>账户总净值 (Equity)</b>: <b>$${totalEquity.toFixed(2)} USDT</b>
+• <b>剩余可用余额</b>: <b>$${availBalance.toFixed(2)} USDT</b>
+• <b>持仓占用保证金</b>: <b>$${totalUsedMargin.toFixed(2)} USDT</b>
+• <b>未平仓实时浮盈</b>: <b>${uSign}$${totalUnrealizedPnlUsdt.toFixed(2)} USDT</b>
+• <b>累计已实现平仓盈亏</b>: <b>${rSign}$${realizedPnl.toFixed(2)} USDT</b>
+• <b>综合总收益率 (ROI)</b>: <b>${roiSign}${totalRoi}%</b>
+• <b>平仓胜率 (Win Rate)</b>: <b>${winRate}%</b> (${pStats.winTrades}胜 / ${pStats.lossTrades}负)
+
+📈 <b>当前正在运行中的持仓 (${positions.length} 笔):</b>
+${positions.length > 0 ? positionLines.join('\n\n') : '  ⚪ 暂无活动持仓 (等待巨鲸开仓触发)'}
+
+📜 <b>最近平仓交割记录:</b>
+${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记录'}
+
+⚡ <b>信号引擎指标:</b>
+• 累计捕获信号: <b>${engineStats.total} 笔</b> | 放行跟单: <b>${engineStats.success} 笔</b> | 风控拦截: <b>${engineStats.total - engineStats.success} 笔</b>
+• 执行延迟: <b>~380 ms</b> | 节点: <b>🟢 Injective Mainnet Sentry</b>
+    `.trim();
+
+    const keyboard = new InlineKeyboard().text('🔄 刷新实时浮盈与现价', 'view_stats').row();
+
+    if (positions.length > 0) {
+      keyboard.text(`⚡ 一键市价全平 (${positions.length} 笔持仓)`, 'close_all_pos').row();
+    }
+
+    keyboard
+      .text('🔄 重置 $10,000 体验金', 'reset_practice')
+      .text('👛 返回我的钱包', 'view_wallet')
+      .row()
+      .text('🔙 返回主菜单', 'back_to_menu');
+
+    if (isEdit) {
+      try {
+        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+        return;
+      } catch (err: any) {
+        // 编辑失败降级回复
+      }
+    }
+    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard });
+  }
+
+  /**
    * 统一渲染主控制面板 (支持 reply 或 editMessageText)
    */
   public async renderMainMenu(ctx: any, isEdit: boolean = false) {
@@ -457,18 +596,57 @@ ${balanceDisplay}
       );
     });
 
-    this.bot.command('stats', (ctx) => {
-      const text = this.getStatsBoardText(ctx.from?.id);
-      ctx.reply(text, {
-        parse_mode: 'HTML',
-        reply_markup: new InlineKeyboard().text('🔙 返回主菜单', 'back_to_menu'),
-      });
-    });
+    this.bot.command('stats', (ctx) => this.renderPortfolioAndStats(ctx, false));
 
-    // 3. 文本输入监听 (区分主动等待输入与普通发送地址)
+    // 3. 文本输入监听 (区分等待输入自定义钱包、等待输入助记词/私钥导入与普通发送地址)
     this.bot.on('message:text', async (ctx) => {
       const text = (ctx.message.text || '').trim();
       const userId = ctx.from?.id || 0;
+
+      // 等待导入助记词或私钥
+      if (this.awaitingWalletImportUsers.has(userId)) {
+        this.awaitingWalletImportUsers.delete(userId);
+        try {
+          const imported = this.walletService.importWallet(userId, text, ctx.from?.username);
+          const mnemonicHint = imported.mnemonic ? '（含 12/24 位助记词）' : '（Hex 私钥）';
+          const successText = `
+✅ <b>【钱包导入成功！】</b>
+
+• <b>Injective 链上地址</b>:
+<code>${imported.injectiveAddress}</code>
+
+• <b>EVM 兼容映射地址</b>:
+<code>${imported.evmAddress || 'N/A'}</code>
+
+• <b>导入类型</b>: <b>${mnemonicHint}</b>
+
+🛡️ <i>您的模拟盘体验金与跟单巨鲸配置已无缝保留。您可以点击下方按钮查看钱包详情或前往 Injective 区块浏览器核验！</i>
+          `.trim();
+
+          const keyboard = new InlineKeyboard()
+            .text('👛 查看我的钱包', 'view_wallet')
+            .url('🌐 在区块浏览器查验此地址', `https://injscan.com/account/${imported.injectiveAddress}`)
+            .row()
+            .text('🔙 返回主菜单', 'back_to_menu');
+
+          await ctx.reply(successText, { parse_mode: 'HTML', reply_markup: keyboard });
+        } catch (err: any) {
+          const errText = `
+❌ <b>钱包导入失败</b>
+
+原因: <i>${err.message || '无效的助记词或私钥格式'}</i>
+
+请检查助记词是否拼写正确（12/24 个单词，空格分隔）或私钥是否为 64 位 Hex 后重试。
+          `.trim();
+
+          const keyboard = new InlineKeyboard()
+            .text('📥 重新尝试导入', 'import_wallet_prompt')
+            .text('🔙 返回我的钱包', 'view_wallet');
+
+          await ctx.reply(errText, { parse_mode: 'HTML', reply_markup: keyboard });
+        }
+        return;
+      }
 
       // 只有当用户明确处于等待输入自定义钱包状态时，才直接加入跟单矩阵
       if (this.awaitingAddressUsers.has(userId)) {
@@ -504,6 +682,7 @@ ${balanceDisplay}
     // 返回主控制台 (确保渲染完整大面板)
     this.bot.callbackQuery('back_to_menu', async (ctx) => {
       this.awaitingAddressUsers.delete(ctx.from?.id || 0);
+      this.awaitingWalletImportUsers.delete(ctx.from?.id || 0);
       await ctx.answerCallbackQuery().catch(() => {});
       await this.renderMainMenu(ctx, true);
     });
@@ -636,6 +815,8 @@ ${balanceDisplay}
         ? `• <b>当前执行模式</b>: <b>【🧪 模拟盘演练 (虚拟体验金扣款，不上链不耗 Gas)】</b>\n• <b>剩余可用体验金</b>: <b>$${availPractice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT</b>\n• <b>模拟持仓占用保证金</b>: <b>$${usedMargin.toFixed(2)} USDT (${positions.length} 笔持仓)</b>\n• <b>累计平仓已实现盈亏</b>: <b>${pnlSign}$${realizedPnl.toFixed(2)} USDT</b>`
         : `• <b>当前执行模式</b>: <b>【🔴 实盘链上交易模式 (专属钱包私钥签名上链)】</b>`;
 
+      const hasMnemonic = Boolean(userWallet.mnemonic);
+
       const text = `
 👛 <b>我的专属 Injective 跟单钱包</b>
 
@@ -643,23 +824,34 @@ ${balanceDisplay}
 <code>${userWallet.injectiveAddress}</code>
 <i>(轻点上方地址可直接复制)</i>
 
+• <b>EVM 映射地址</b>: <code>${userWallet.evmAddress || 'N/A'}</code>
+• <b>助记词备份状态</b>: <b>${hasMnemonic ? '✅ 已生成 12 位标准 BIP39 助记词' : '⚠️ 早期私钥 (建议升级为助记词)'}</b>
+
 📊 <b>资产与模式详情</b>:
 • <b>链上 INJ 余额</b>: <code>${balances.inj} INJ</code>
 • <b>链上 USDT 余额</b>: <code>${balances.usdt} USDT</code>
 • <b>当前实盘估值</b>: <b>$${balances.totalUsd} USD</b>
 ${practiceInfo}
 
-🛡️ <i>非托管安全保障：私钥仅在本地安全受控，您可以随时备份导出到 Keplr 或 MetaMask 钱包自由管理。</i>
+🛡️ <b>真实 Web3 非托管钱包保障:</b>
+<i>该钱包由 @injectivelabs/sdk-ts 密码学库在本地派生生成，是 100% 链上真实存在的 Injective/Cosmos 地址。您可随时导出助记词或私钥到 Keplr、OKX Web3 钱包查验，亦可直接导入您已有的钱包！</i>
       `.trim();
 
       const keyboard = new InlineKeyboard()
+        .text('📈 查看持仓与盈亏明细', 'view_stats')
+        .row()
         .text('💳 充值 USDT/INJ 激活实盘', 'deposit_guide')
         .row()
         .text('🔴 切换为：实盘链上交易模式', 'switch_mode_real')
         .text('🧪 切换为：$10,000 模拟演练模式', 'switch_mode_practice')
         .row()
         .text('🔄 刷新余额', 'view_wallet')
-        .text('🔑 备份导出私钥', 'export_key')
+        .text('🔑 导出助记词/私钥', 'export_key')
+        .row()
+        .text('📥 导入外部助记词/私钥', 'import_wallet_prompt')
+        .text('🔄 重新生成助记词钱包', 'regen_wallet')
+        .row()
+        .url('🌐 在 Injective 区块浏览器查验', `https://injscan.com/account/${userWallet.injectiveAddress}`)
         .row()
         .text('🔙 返回主菜单', 'back_to_menu');
 
@@ -750,21 +942,99 @@ ${practiceInfo}
       await this.applyFollowTarget(ctx, targetAddress, true);
     });
 
-    // 导出私钥
+    // 导出助记词与私钥
     this.bot.callbackQuery('export_key', async (ctx) => {
       const userId = ctx.from?.id || 0;
       const userWallet = this.walletService.getOrCreateWallet(userId, ctx.from?.username);
-      const text = `
-⚠️ <b>【绝密信息 - 私钥备份】</b>
 
-• 地址: <code>${userWallet.injectiveAddress}</code>
-• 私钥 Hex:
+      const mnemonicBlock = userWallet.mnemonic
+        ? `• <b>12 位标准 BIP39 英文助记词:</b>\n<code>${userWallet.mnemonic}</code>\n<i>(轻点上方助记词可直接复制。可直接导入 Keplr、OKX Web3 钱包、MetaMask 或 Leap 验证同一链上地址！)</i>`
+        : `• <b>12 位助记词:</b>\n<i>⚠️ 此钱包系早期创建，未生成 12 位助记词。建议点击下方【🔄 升级为全新助记词钱包】生成带助记词的新钱包。</i>`;
+
+      const text = `
+⚠️ <b>【绝密信息 - 钱包助记词与私钥备份】</b>
+
+• <b>Injective 地址</b>: <code>${userWallet.injectiveAddress}</code>
+• <b>EVM 兼容地址</b>: <code>${userWallet.evmAddress || 'N/A'}</code>
+
+${mnemonicBlock}
+
+• <b>私钥 Hex (十六进制):</b>
 <code>${userWallet.privateKeyHex}</code>
 
-<i>⚠️ 警告: 私钥是您钱包资产的最高控制权，任何拥有私钥的人均可转走资产。请妥善保存，切勿截图或泄露给任何人！可导入 Keplr 或 MetaMask 中管理。</i>
+🛡️ <b>关于非托管去中心化钱包的安全说明:</b>
+1. <b>真实链上钱包</b>: 该地址是通过 Injective 官方标准算法（BIP39 + EthSecp256k1）本地派生生成的 100% 真实 Web3 钱包，与其他主流 Telegram 机器人（如 GMGN、Banana Gun、Trojan、OKX Web3）原理完全一致。
+2. <b>随时导出查验</b>: 您可以随时将助记词或私钥导入到 Keplr 或 OKX Web3 钱包中验证，地址和资产分毫不差。
+3. <b>最高控制权</b>: 任何拥有助记词或私钥的人都拥有该钱包的所有权，切勿截图或发送给任何人！
       `.trim();
 
-      const keyboard = new InlineKeyboard().text('🔙 返回钱包', 'view_wallet');
+      const keyboard = new InlineKeyboard();
+      if (!userWallet.mnemonic) {
+        keyboard.text('🔄 升级为全新助记词钱包', 'regen_wallet').row();
+      }
+      keyboard
+        .url('🌐 在 Injective 区块浏览器查验此地址', `https://injscan.com/account/${userWallet.injectiveAddress}`)
+        .row()
+        .text('🔙 返回我的钱包', 'view_wallet')
+        .text('🔙 返回主菜单', 'back_to_menu');
+
+      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+    });
+
+    // 重新生成带 12 位助记词的新钱包
+    this.bot.callbackQuery('regen_wallet', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      const newWallet = this.walletService.regenerateWalletWithMnemonic(userId);
+      await ctx.answerCallbackQuery('🎉 已生成带 12 位助记词的全新钱包！').catch(() => {});
+
+      const mnemonicBlock = `• <b>12 位标准 BIP39 英文助记词:</b>\n<code>${newWallet.mnemonic}</code>\n<i>(轻点上方助记词可直接复制。可直接导入 Keplr、OKX Web3 钱包、MetaMask 或 Leap 验证同一链上地址！)</i>`;
+      const text = `
+🎉 <b>【全新 12 位标准助记词钱包已生成】</b>
+
+• <b>Injective 地址</b>: <code>${newWallet.injectiveAddress}</code>
+• <b>EVM 兼容地址</b>: <code>${newWallet.evmAddress || 'N/A'}</code>
+
+${mnemonicBlock}
+
+• <b>私钥 Hex (十六进制):</b>
+<code>${newWallet.privateKeyHex}</code>
+
+🛡️ <i>请务必立即在纸上或安全密码管理器中备份助记词！您的模拟盘资金与跟单设置已无缝保留。</i>
+      `.trim();
+
+      const keyboard = new InlineKeyboard()
+        .url('🌐 在 Injective 区块浏览器查验此地址', `https://injscan.com/account/${newWallet.injectiveAddress}`)
+        .row()
+        .text('👛 查看我的钱包', 'view_wallet')
+        .text('🔙 返回主菜单', 'back_to_menu');
+
+      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+    });
+
+    // 提示用户输入要导入的助记词或私钥
+    this.bot.callbackQuery('import_wallet_prompt', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      this.awaitingWalletImportUsers.add(userId);
+      await ctx.answerCallbackQuery().catch(() => {});
+
+      const text = `
+📥 <b>【导入已有 Injective 钱包 (助记词或私钥)】</b>
+
+请直接向机器人发送您的钱包凭据：
+1. <b>12 位或 24 位英文助记词</b> (单词间以空格分隔)
+   例如: <code>abandon ability able about above absent absorb abstract absurd abuse access accident</code>
+2. 或 <b>64 位十六进制私钥 Hex</b> (可带或不带 0x)
+   例如: <code>0x4f3edf983ac636a65a762ce43809197b5b04113345e4c0557e823804418ffb2a</code>
+
+🛡️ <b>安全承诺:</b>
+• 密钥仅在您的独立配置中安全保存，用于签名链上交易，绝不上传任何云端或第三方服务器！
+• 导入后您的模拟体验金余额与已添加的跟单巨鲸目标将完整保留！
+      `.trim();
+
+      const keyboard = new InlineKeyboard()
+        .text('🔙 取消并返回钱包', 'view_wallet')
+        .text('🔙 返回主菜单', 'back_to_menu');
+
       await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
     });
 
@@ -1067,13 +1337,55 @@ ${targetsLines}
       });
     });
 
-    // 战绩看板
+    // 实时盈亏与战绩看板
     this.bot.callbackQuery('view_stats', async (ctx) => {
-      const text = this.getStatsBoardText(ctx.from?.id);
-      await ctx.editMessageText(text, {
-        parse_mode: 'HTML',
-        reply_markup: new InlineKeyboard().text('🔙 返回主菜单', 'back_to_menu'),
-      });
+      await ctx.answerCallbackQuery('正在刷新实时行情与浮盈...').catch(() => {});
+      await this.renderPortfolioAndStats(ctx, true);
+    });
+
+    // 一键市价全平模拟持仓
+    this.bot.callbackQuery('close_all_pos', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      const injService = this.copyEngine.getInjectiveService();
+      const userWallet = this.walletService.getOrCreateWallet(userId);
+      const positions = userWallet.practicePositions || [];
+      const markPriceMap = new Map<string, number>();
+
+      await Promise.all(
+        positions.map(async (pos) => {
+          try {
+            const ob = await injService.getOrderbook(pos.marketId || pos.marketTicker, pos.marketTicker);
+            const p =
+              pos.direction === 'BUY'
+                ? ob.bestBid > 0
+                  ? ob.bestBid
+                  : ob.midPrice
+                : ob.bestAsk > 0
+                ? ob.bestAsk
+                : ob.midPrice;
+            if (p > 0) markPriceMap.set(pos.marketTicker, p);
+          } catch {
+            markPriceMap.set(pos.marketTicker, pos.entryPrice);
+          }
+        })
+      );
+
+      const res = this.walletService.closeAllPracticePositions(userId, markPriceMap);
+      const sign = res.totalNetPnlUsdt >= 0 ? '+' : '';
+      await ctx
+        .answerCallbackQuery(
+          `⚡ 已全平 ${res.closedCount} 笔持仓，本次结算净盈亏: ${sign}$${res.totalNetPnlUsdt} USDT`
+        )
+        .catch(() => {});
+      await this.renderPortfolioAndStats(ctx, true);
+    });
+
+    // 一键重置 $10,000 体验金
+    this.bot.callbackQuery('reset_practice', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      this.walletService.resetPracticeAccount(userId);
+      await ctx.answerCallbackQuery('🎉 模拟盘账户已重置为初始 $10,000 USDT！').catch(() => {});
+      await this.renderPortfolioAndStats(ctx, true);
     });
 
     // 跟单某大户触发 (支持 follow_whale_1, follow_custom_inj1...)

@@ -23,11 +23,12 @@ async function runSimulation() {
   4. 验证多巨鲸并发跟单矩阵 (Multi-Whale Copy Matrix): 同时跟单多个巨鲸不覆盖 + 单独移除
   5. 验证 0 余额处理、$10,000 模拟盘演练与【实盘私钥签名 vs 模拟盘流水号】显式分流
   6. 验证端到端多巨鲸信号捕获、用户专属钱包私钥签名构造与滑点风控拦截
+  7. 验证 12 位 BIP39 助记词生成与导入、单币种持仓合并与真实盘口成交价
 ========================================================================
   `);
 
   // --- 测试用例 1: 网络抽象解析与开发者 40% 手续费返佣地址绑定 ---
-  console.log('[1/6] 验证网络抽象解析与开发者 40% 手续费返佣地址...');
+  console.log('[1/7] 验证网络抽象解析与开发者 40% 手续费返佣地址...');
   const testnetRes = parseNetwork('testnet');
   const mainnetRes = parseNetwork('mainnet');
   const defaultRes = parseNetwork();
@@ -435,8 +436,87 @@ async function runSimulation() {
     throw new Error('风控与跟单撮合结果不符合预期！');
   }
 
+  // --- 测试用例 7: 验证 12 位 BIP39 助记词生成与导入、单币种持仓合并与防滑点虚扣 ---
+  console.log('\n[7/7] 验证 12 位 BIP39 助记词生成与导入、单币种持仓合并与真实盘口成交价...');
+  const testUserId = 88000000 + Math.floor(Math.random() * 100000);
+  const testWallet = walletService.getOrCreateWallet(testUserId, 'test_trader');
+  console.log(`   - 自动派生钱包地址: ${testWallet.injectiveAddress}`);
+  console.log(`   - 自动生成 12 位助记词: ${testWallet.mnemonic ? '✅ ' + testWallet.mnemonic : '❌ 未生成'}`);
+  if (!testWallet.mnemonic || testWallet.mnemonic.split(' ').length !== 12) {
+    throw new Error('未成功生成标准 12 位 BIP39 助记词！');
+  }
+
+  // 验证重新生成助记词钱包
+  const originalMnemonic = testWallet.mnemonic!;
+  const originalAddress = testWallet.injectiveAddress;
+  const regenWallet = walletService.regenerateWalletWithMnemonic(testUserId);
+  if (!regenWallet.mnemonic || regenWallet.mnemonic === originalMnemonic) {
+    throw new Error('重新生成助记词钱包异常！');
+  }
+
+  // 验证导入助记词并恢复原地址
+  const importedWallet = walletService.importWallet(testUserId, originalMnemonic);
+  if (importedWallet.injectiveAddress !== originalAddress) {
+    throw new Error('导入助记词恢复的地址与原地址不一致！');
+  }
+
+  // 验证连续多次相同标的、同方向开仓：严格合并为 1 笔净持仓 (绝不允许堆积 142 笔仓位)
+  walletService.resetPracticeAccount(testUserId);
+  walletService.executePracticeTrade(testUserId, {
+    marketTicker: 'QNT/USDC PERP',
+    direction: 'BUY',
+    price: 200.0,
+    quantity: 1.0,
+    marginUsdt: 40.0,
+    leverage: 5,
+  });
+
+  walletService.executePracticeTrade(testUserId, {
+    marketTicker: 'QNT/USDC PERP',
+    direction: 'BUY',
+    price: 204.0,
+    quantity: 1.0,
+    marginUsdt: 40.8,
+    leverage: 5,
+  });
+
+  const mergedWallet = walletService.getOrCreateWallet(testUserId);
+  const posCount = (mergedWallet.practicePositions || []).length;
+  const mergedPos = mergedWallet.practicePositions![0];
+  console.log(`   - 同向连续开仓合并验证: 持仓数=${posCount} (预期 1 笔), 均价=$${mergedPos.entryPrice} (预期 $202.0), 数量=${mergedPos.quantity} (预期 2.0)`);
+  if (posCount !== 1 || mergedPos.entryPrice !== 202.0 || mergedPos.quantity !== 2.0) {
+    throw new Error(`同向开仓未能正确合并为 1 笔净持仓: count=${posCount}, avgPrice=${mergedPos.entryPrice}`);
+  }
+
+  // 验证反向开仓触发平仓与历史交割记录
+  const closeRes = walletService.executePracticeTrade(testUserId, {
+    marketTicker: 'QNT/USDC PERP',
+    direction: 'SELL',
+    price: 205.0,
+    quantity: 2.0,
+    marginUsdt: 0,
+    leverage: 5,
+  });
+  console.log(`   - 反向平仓结算验证: action=${closeRes.action}, realizedPnlDelta=+$${closeRes.realizedPnlDelta} USDT, 历史记录数=${mergedWallet.practiceTradeHistory?.length}`);
+  if (closeRes.action !== 'CLOSE' || (closeRes.realizedPnlDelta ?? 0) <= 0 || (mergedWallet.practiceTradeHistory?.length ?? 0) !== 1) {
+    throw new Error('反向平仓结算或交割历史记录异常！');
+  }
+
+  // 验证真实成交价 (fillPrice) 与最差滑点保护价 (adjustedPrice) 区分，杜绝来回损耗 3%
+  const riskEval = new RiskManager(config).evaluate({
+    event: { ...normalEvent, price: 100.0 },
+    market,
+    currentMidPrice: 100.0,
+    currentAsk: 100.05,
+    currentBid: 99.95,
+  });
+  console.log(`   - 风控撮合价格区分: fillPrice=$${riskEval.fillPrice} (盘口对手价) vs adjustedPrice=$${riskEval.adjustedPrice} (最差保护价)`);
+  if (!riskEval.fillPrice || riskEval.fillPrice === riskEval.adjustedPrice || !riskEval.passed) {
+    throw new Error('未能严格区分真实盘口成交价 (fillPrice) 与滑点保护价 (adjustedPrice)！');
+  }
+
   console.log('\n========================================================================');
-  console.log('🎉 全部 6 项生产级仿真与核心业务测试圆满通过！');
+  console.log('🎉 全部 7 项生产级仿真与核心业务测试圆满通过！');
   console.log('========================================================================\n');
 }
 

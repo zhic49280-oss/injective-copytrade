@@ -44,6 +44,8 @@ export interface RiskCheckInput {
   event: SmartMoneyTradeEvent;
   market: MarketInfo;
   currentMidPrice: number;
+  currentAsk?: number;
+  currentBid?: number;
 }
 
 export interface RiskCheckResult {
@@ -51,9 +53,12 @@ export interface RiskCheckResult {
   reason?: string;
   adjustedQuantity: number;
   adjustedPrice: number;
+  fillPrice?: number;
   calculatedMargin: number;
   leverage: number;
 }
+
+export type RiskEvaluationResult = RiskCheckResult;
 
 /**
  * 跟单执行结果

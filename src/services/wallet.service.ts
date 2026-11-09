@@ -5,6 +5,7 @@ import BigNumber from 'bignumber.js';
 import { AppConfig } from '../config/index.js';
 
 export interface PracticePosition {
+  marketId?: string;
   marketTicker: string;
   direction: 'BUY' | 'SELL';
   entryPrice: number;
@@ -12,6 +13,22 @@ export interface PracticePosition {
   marginUsdt: number;
   leverage: number;
   timestamp: number;
+}
+
+export interface PracticeTradeHistoryItem {
+  marketTicker: string;
+  direction: 'BUY' | 'SELL';
+  entryPrice: number;
+  exitPrice: number;
+  quantity: number;
+  netPnlUsdt: number;
+  closedAt: number;
+}
+
+export interface PracticeStats {
+  totalTrades: number;
+  winTrades: number;
+  lossTrades: number;
 }
 
 export interface FollowedTarget {
@@ -24,13 +41,17 @@ export interface UserWallet {
   telegramId: number;
   username?: string;
   injectiveAddress: string;
+  evmAddress?: string;
   subaccountId: string;
   privateKeyHex: string;
+  mnemonic?: string;
   createdAt: number;
   practiceMode?: boolean;
   practiceBalanceUsdt?: number;
   practicePositions?: PracticePosition[];
   practiceRealizedPnlUsdt?: number;
+  practiceTradeHistory?: PracticeTradeHistoryItem[];
+  practiceStats?: PracticeStats;
   isCopyingEnabled?: boolean;
   targetTraderAddress?: string;
   targetTraderName?: string;
@@ -102,6 +123,91 @@ export class WalletService {
     return dirtyFixed;
   }
 
+  /**
+   * 自动将历史碎片化模拟持仓（如同一标的上百笔拆分持仓）合并为每个 marketTicker 最多 1 笔净持仓
+   */
+  public consolidatePracticePositions(item: UserWallet): boolean {
+    if (!Array.isArray(item.practicePositions) || item.practicePositions.length <= 1) {
+      return false;
+    }
+
+    const seenTickers = new Set<string>();
+    let hasDuplicateTicker = false;
+    for (const p of item.practicePositions) {
+      if (seenTickers.has(p.marketTicker)) {
+        hasDuplicateTicker = true;
+        break;
+      }
+      seenTickers.add(p.marketTicker);
+    }
+
+    if (!hasDuplicateTicker) {
+      return false;
+    }
+
+    if (item.practiceBalanceUsdt === undefined) item.practiceBalanceUsdt = 10000;
+    if (item.practiceRealizedPnlUsdt === undefined) item.practiceRealizedPnlUsdt = 0;
+    if (!Array.isArray(item.practiceTradeHistory)) item.practiceTradeHistory = [];
+    if (!item.practiceStats) {
+      item.practiceStats = { totalTrades: 0, winTrades: 0, lossTrades: 0 };
+    }
+
+    const netByTicker = new Map<string, PracticePosition>();
+    for (const pos of item.practicePositions) {
+      const existing = netByTicker.get(pos.marketTicker);
+      if (!existing) {
+        netByTicker.set(pos.marketTicker, { ...pos });
+      } else if (existing.direction === pos.direction) {
+        // 同向加仓：加权平均计算开仓均价并合并数量与保证金
+        const newQty = Number((existing.quantity + pos.quantity).toFixed(6));
+        const avgEntry =
+          newQty > 0
+            ? Number(
+                ((existing.entryPrice * existing.quantity + pos.entryPrice * pos.quantity) / newQty).toFixed(6)
+              )
+            : existing.entryPrice;
+        existing.quantity = newQty;
+        existing.entryPrice = avgEntry;
+        existing.marginUsdt = Number((existing.marginUsdt + (pos.marginUsdt || 0)).toFixed(2));
+        existing.timestamp = Math.max(existing.timestamp || 0, pos.timestamp || 0);
+        if (pos.marketId && !existing.marketId) existing.marketId = pos.marketId;
+      } else {
+        // 反向对冲平仓：释放双向占用保证金并结算净盈亏
+        const grossPnl =
+          existing.direction === 'BUY'
+            ? (pos.entryPrice - existing.entryPrice) * existing.quantity
+            : (existing.entryPrice - pos.entryPrice) * existing.quantity;
+        const fee = pos.entryPrice * existing.quantity * 0.001;
+        const netPnl = Number((grossPnl - fee).toFixed(2));
+
+        item.practiceBalanceUsdt = Number(
+          (item.practiceBalanceUsdt + (existing.marginUsdt || 0) + (pos.marginUsdt || 0) + netPnl).toFixed(2)
+        );
+        item.practiceRealizedPnlUsdt = Number((item.practiceRealizedPnlUsdt + netPnl).toFixed(2));
+        item.practiceStats.totalTrades += 1;
+        if (netPnl >= 0) item.practiceStats.winTrades += 1;
+        else item.practiceStats.lossTrades += 1;
+
+        item.practiceTradeHistory.unshift({
+          marketTicker: existing.marketTicker,
+          direction: existing.direction,
+          entryPrice: existing.entryPrice,
+          exitPrice: pos.entryPrice,
+          quantity: existing.quantity,
+          netPnlUsdt: netPnl,
+          closedAt: pos.timestamp || Date.now(),
+        });
+        if (item.practiceTradeHistory.length > 20) {
+          item.practiceTradeHistory = item.practiceTradeHistory.slice(0, 20);
+        }
+        netByTicker.delete(pos.marketTicker);
+      }
+    }
+
+    item.practicePositions = Array.from(netByTicker.values());
+    return true;
+  }
+
   private loadWallets() {
     try {
       const dir = path.dirname(this.storageFile);
@@ -124,6 +230,24 @@ export class WalletService {
           }
           if (item.practiceRealizedPnlUsdt === undefined) {
             item.practiceRealizedPnlUsdt = 0;
+          }
+          if (!Array.isArray(item.practiceTradeHistory)) {
+            item.practiceTradeHistory = [];
+          }
+          if (!item.practiceStats) {
+            item.practiceStats = { totalTrades: 0, winTrades: 0, lossTrades: 0 };
+          }
+          if (!item.evmAddress && item.privateKeyHex) {
+            try {
+              const cleanPk = item.privateKeyHex.startsWith('0x') ? item.privateKeyHex : `0x${item.privateKeyHex}`;
+              item.evmAddress = PrivateKey.fromHex(cleanPk).toAddress().toHex();
+              dirtyFixed = true;
+            } catch {
+              // ignore
+            }
+          }
+          if (this.consolidatePracticePositions(item)) {
+            dirtyFixed = true;
           }
           this.wallets.set(item.telegramId, item);
         }
@@ -157,28 +281,33 @@ export class WalletService {
   }
 
   /**
-   * 获取或自动为用户创建专属 Injective 真实链上钱包
+   * 获取或自动为用户创建专属 Injective 真实链上钱包 (保存 12 位 BIP39 助记词与私钥)
    */
   public getOrCreateWallet(telegramId: number, username?: string): UserWallet {
     let wallet = this.wallets.get(telegramId);
     if (!wallet) {
-      // 链上生成真实私钥与地址
+      // 链上生成标准 BIP39 12位助记词、真实私钥与地址
       const pkObj = PrivateKey.generate();
       const pk = pkObj.privateKey;
       const injectiveAddress = pk.toBech32();
+      const evmAddress = pk.toAddress().toHex();
       const subaccountId = getSubaccountId(injectiveAddress, 0);
 
       wallet = {
         telegramId,
         username,
         injectiveAddress,
+        evmAddress,
         subaccountId,
         privateKeyHex: pk.toPrivateKeyHex(),
+        mnemonic: pkObj.mnemonic,
         createdAt: Date.now(),
         practiceMode: false,
         practiceBalanceUsdt: 10000,
         practicePositions: [],
         practiceRealizedPnlUsdt: 0,
+        practiceTradeHistory: [],
+        practiceStats: { totalTrades: 0, winTrades: 0, lossTrades: 0 },
         followedTargets: [],
       };
 
@@ -189,6 +318,8 @@ export class WalletService {
       if (wallet.practiceBalanceUsdt === undefined) wallet.practiceBalanceUsdt = 10000;
       if (!Array.isArray(wallet.practicePositions)) wallet.practicePositions = [];
       if (wallet.practiceRealizedPnlUsdt === undefined) wallet.practiceRealizedPnlUsdt = 0;
+      if (!Array.isArray(wallet.practiceTradeHistory)) wallet.practiceTradeHistory = [];
+      if (!wallet.practiceStats) wallet.practiceStats = { totalTrades: 0, winTrades: 0, lossTrades: 0 };
       if (!Array.isArray(wallet.followedTargets)) wallet.followedTargets = [];
     }
     return wallet;
@@ -204,6 +335,8 @@ export class WalletService {
       wallet.practiceBalanceUsdt = 10000;
       wallet.practicePositions = [];
       wallet.practiceRealizedPnlUsdt = 0;
+      wallet.practiceTradeHistory = [];
+      wallet.practiceStats = { totalTrades: 0, winTrades: 0, lossTrades: 0 };
     }
     this.saveWallets();
     return wallet;
@@ -215,69 +348,292 @@ export class WalletService {
   }
 
   /**
-   * 执行模拟体验金交易 (真实扣减可用体验金保证金、记录模拟持仓与反向平仓结算盈亏)
+   * 执行模拟体验金交易 (确保每个 marketTicker 最多 1 笔净持仓：同向加权合并均价，反向平仓结算盈亏并计入历史)
    */
   public executePracticeTrade(
     telegramId: number,
-    params: {
-      marketTicker: string;
-      direction: 'BUY' | 'SELL';
-      price: number;
-      quantity: number;
-      marginUsdt: number;
-      leverage: number;
-    }
-  ): { success: boolean; wallet: UserWallet; realizedPnlDelta: number; error?: string } {
+    paramsOrTicker:
+      | {
+          marketId?: string;
+          marketTicker: string;
+          direction: 'BUY' | 'SELL';
+          price: number;
+          quantity: number;
+          marginUsdt?: number;
+          leverage: number;
+        }
+      | string,
+    directionArg?: 'BUY' | 'SELL',
+    priceArg?: number,
+    quantityArg?: number,
+    leverageArg?: number,
+    marketIdArg?: string
+  ): {
+    success: boolean;
+    action: 'OPEN' | 'CLOSE';
+    wallet: UserWallet;
+    realizedPnlDelta: number;
+    closedPosition?: PracticeTradeHistoryItem;
+    error?: string;
+  } {
     const wallet = this.getOrCreateWallet(telegramId);
     if (wallet.practiceBalanceUsdt === undefined) wallet.practiceBalanceUsdt = 10000;
     if (!Array.isArray(wallet.practicePositions)) wallet.practicePositions = [];
     if (wallet.practiceRealizedPnlUsdt === undefined) wallet.practiceRealizedPnlUsdt = 0;
+    if (!Array.isArray(wallet.practiceTradeHistory)) wallet.practiceTradeHistory = [];
+    if (!wallet.practiceStats) {
+      wallet.practiceStats = { totalTrades: 0, winTrades: 0, lossTrades: 0 };
+    }
 
-    let realizedPnlDelta = 0;
-    const existingIdx = wallet.practicePositions.findIndex(
-      (p) => p.marketTicker === params.marketTicker && p.direction !== params.direction
-    );
+    const params =
+      typeof paramsOrTicker === 'string'
+        ? {
+            marketTicker: paramsOrTicker,
+            direction: directionArg!,
+            price: priceArg!,
+            quantity: quantityArg!,
+            leverage: leverageArg || 5,
+            marginUsdt: ((priceArg || 0) * (quantityArg || 0)) / (leverageArg || 5),
+            marketId: marketIdArg,
+          }
+        : {
+            ...paramsOrTicker,
+            marginUsdt:
+              paramsOrTicker.marginUsdt !== undefined
+                ? paramsOrTicker.marginUsdt
+                : (paramsOrTicker.price * paramsOrTicker.quantity) / (paramsOrTicker.leverage || 5),
+          };
 
-    // 若存在反向持仓，先平仓结算盈亏并释放原占用保证金
-    if (existingIdx !== -1) {
+    const existingIdx = wallet.practicePositions.findIndex((p) => p.marketTicker === params.marketTicker);
+
+    // 情况 1: 已存在同标的持仓且方向相反 -> 执行平仓结算 (释放原保证金 + 结算净盈亏 - 0.1% 手续费)
+    if (existingIdx !== -1 && wallet.practicePositions[existingIdx].direction !== params.direction) {
       const existing = wallet.practicePositions[existingIdx];
       const priceDiff =
         existing.direction === 'BUY'
           ? params.price - existing.entryPrice
           : existing.entryPrice - params.price;
-      const pnl = Number((priceDiff * existing.quantity).toFixed(2));
-      realizedPnlDelta = pnl;
+      const grossPnl = priceDiff * existing.quantity;
+      const fee = params.price * existing.quantity * 0.001;
+      const netPnl = Number((grossPnl - fee).toFixed(2));
+
       wallet.practiceBalanceUsdt = Number(
-        (wallet.practiceBalanceUsdt + existing.marginUsdt + pnl).toFixed(2)
+        (wallet.practiceBalanceUsdt + existing.marginUsdt + netPnl).toFixed(2)
       );
-      wallet.practiceRealizedPnlUsdt = Number((wallet.practiceRealizedPnlUsdt + pnl).toFixed(2));
+      wallet.practiceRealizedPnlUsdt = Number((wallet.practiceRealizedPnlUsdt + netPnl).toFixed(2));
+
+      wallet.practiceStats.totalTrades += 1;
+      if (netPnl >= 0) {
+        wallet.practiceStats.winTrades += 1;
+      } else {
+        wallet.practiceStats.lossTrades += 1;
+      }
+
+      const closedRecord: PracticeTradeHistoryItem = {
+        marketTicker: existing.marketTicker,
+        direction: existing.direction,
+        entryPrice: existing.entryPrice,
+        exitPrice: params.price,
+        quantity: existing.quantity,
+        netPnlUsdt: netPnl,
+        closedAt: Date.now(),
+      };
+      wallet.practiceTradeHistory.unshift(closedRecord);
+      if (wallet.practiceTradeHistory.length > 20) {
+        wallet.practiceTradeHistory = wallet.practiceTradeHistory.slice(0, 20);
+      }
+
       wallet.practicePositions.splice(existingIdx, 1);
+      this.saveWallets();
+
+      return {
+        success: true,
+        action: 'CLOSE',
+        wallet,
+        realizedPnlDelta: netPnl,
+        closedPosition: closedRecord,
+      };
     }
 
-    const marginToDeduct = Number(params.marginUsdt.toFixed(2));
+    const marginToDeduct = Number((params.marginUsdt || 0).toFixed(2));
     if (wallet.practiceBalanceUsdt < marginToDeduct) {
       return {
         success: false,
+        action: 'OPEN',
         wallet,
-        realizedPnlDelta,
+        realizedPnlDelta: 0,
         error: `模拟体验金可用余额不足 ($${wallet.practiceBalanceUsdt.toFixed(2)} < $${marginToDeduct.toFixed(2)})`,
       };
     }
 
-    // 真实扣除体验金保证金并记录模拟持仓
     wallet.practiceBalanceUsdt = Number((wallet.practiceBalanceUsdt - marginToDeduct).toFixed(2));
-    wallet.practicePositions.push({
-      marketTicker: params.marketTicker,
-      direction: params.direction,
-      entryPrice: params.price,
-      quantity: params.quantity,
-      marginUsdt: marginToDeduct,
-      leverage: params.leverage,
-      timestamp: Date.now(),
-    });
+
+    // 情况 2: 已存在同标的同向持仓 -> 合并为单笔净持仓并加权更新开仓均价
+    if (existingIdx !== -1) {
+      const existing = wallet.practicePositions[existingIdx];
+      const newQty = Number((existing.quantity + params.quantity).toFixed(6));
+      existing.entryPrice = Number(
+        ((existing.entryPrice * existing.quantity + params.price * params.quantity) / newQty).toFixed(6)
+      );
+      existing.quantity = newQty;
+      existing.marginUsdt = Number((existing.marginUsdt + marginToDeduct).toFixed(2));
+      existing.leverage = params.leverage || existing.leverage;
+      if (params.marketId) existing.marketId = params.marketId;
+      existing.timestamp = Date.now();
+    } else {
+      // 情况 3: 无该标的持仓 -> 新建 1 笔持仓
+      wallet.practicePositions.push({
+        marketId: params.marketId,
+        marketTicker: params.marketTicker,
+        direction: params.direction,
+        entryPrice: params.price,
+        quantity: params.quantity,
+        marginUsdt: marginToDeduct,
+        leverage: params.leverage,
+        timestamp: Date.now(),
+      });
+    }
 
     this.saveWallets();
-    return { success: true, wallet, realizedPnlDelta };
+    return { success: true, action: 'OPEN', wallet, realizedPnlDelta: 0 };
+  }
+
+  /**
+   * 一键重置 $10,000 模拟账户
+   */
+  public resetPracticeAccount(telegramUserId: number): UserWallet {
+    const wallet = this.getOrCreateWallet(telegramUserId);
+    wallet.practiceBalanceUsdt = 10000;
+    wallet.practiceRealizedPnlUsdt = 0;
+    wallet.practicePositions = [];
+    wallet.practiceTradeHistory = [];
+    wallet.practiceStats = { totalTrades: 0, winTrades: 0, lossTrades: 0 };
+    this.saveWallets();
+    return wallet;
+  }
+
+  /**
+   * 一键市价全平所有模拟持仓
+   */
+  public closeAllPracticePositions(
+    telegramUserId: number,
+    markPrices: Map<string, number>
+  ): { closedCount: number; totalNetPnlUsdt: number; wallet: UserWallet } {
+    const wallet = this.getOrCreateWallet(telegramUserId);
+    const positions = wallet.practicePositions || [];
+    if (positions.length === 0) {
+      return { closedCount: 0, totalNetPnlUsdt: 0, wallet };
+    }
+
+    if (wallet.practiceBalanceUsdt === undefined) wallet.practiceBalanceUsdt = 10000;
+    if (wallet.practiceRealizedPnlUsdt === undefined) wallet.practiceRealizedPnlUsdt = 0;
+    if (!Array.isArray(wallet.practiceTradeHistory)) wallet.practiceTradeHistory = [];
+    if (!wallet.practiceStats) {
+      wallet.practiceStats = { totalTrades: 0, winTrades: 0, lossTrades: 0 };
+    }
+
+    let totalNetPnlUsdt = 0;
+    const closedCount = positions.length;
+
+    for (const pos of positions) {
+      const markPrice =
+        markPrices.get(pos.marketTicker) ||
+        (pos.marketId ? markPrices.get(pos.marketId) : undefined) ||
+        pos.entryPrice;
+
+      const priceDiff =
+        pos.direction === 'BUY' ? markPrice - pos.entryPrice : pos.entryPrice - markPrice;
+      const grossPnl = priceDiff * pos.quantity;
+      const fee = markPrice * pos.quantity * 0.001;
+      const netPnl = Number((grossPnl - fee).toFixed(2));
+
+      totalNetPnlUsdt = Number((totalNetPnlUsdt + netPnl).toFixed(2));
+      wallet.practiceBalanceUsdt = Number((wallet.practiceBalanceUsdt + pos.marginUsdt + netPnl).toFixed(2));
+      wallet.practiceRealizedPnlUsdt = Number((wallet.practiceRealizedPnlUsdt + netPnl).toFixed(2));
+
+      wallet.practiceStats.totalTrades += 1;
+      if (netPnl >= 0) {
+        wallet.practiceStats.winTrades += 1;
+      } else {
+        wallet.practiceStats.lossTrades += 1;
+      }
+
+      wallet.practiceTradeHistory.unshift({
+        marketTicker: pos.marketTicker,
+        direction: pos.direction,
+        entryPrice: pos.entryPrice,
+        exitPrice: markPrice,
+        quantity: pos.quantity,
+        netPnlUsdt: netPnl,
+        closedAt: Date.now(),
+      });
+    }
+
+    if (wallet.practiceTradeHistory.length > 20) {
+      wallet.practiceTradeHistory = wallet.practiceTradeHistory.slice(0, 20);
+    }
+    wallet.practicePositions = [];
+    this.saveWallets();
+
+    return { closedCount, totalNetPnlUsdt, wallet };
+  }
+
+  /**
+   * 重新生成带 12 位标准 BIP39 助记词的新钱包（保留用户的模拟盘余额、持仓与跟单配置）
+   */
+  public regenerateWalletWithMnemonic(telegramUserId: number): UserWallet {
+    const wallet = this.getOrCreateWallet(telegramUserId);
+    const pkObj = PrivateKey.generate();
+    const pk = pkObj.privateKey;
+    const injectiveAddress = pk.toBech32();
+    const evmAddress = pk.toAddress().toHex();
+    const subaccountId = getSubaccountId(injectiveAddress, 0);
+
+    wallet.injectiveAddress = injectiveAddress;
+    wallet.evmAddress = evmAddress;
+    wallet.subaccountId = subaccountId;
+    wallet.privateKeyHex = pk.toPrivateKeyHex();
+    wallet.mnemonic = pkObj.mnemonic;
+
+    this.saveWallets();
+    return wallet;
+  }
+
+  /**
+   * 导入外部 12/24 位 BIP39 助记词或 64 位 Hex 私钥（保留用户的模拟盘余额與跟单目标）
+   */
+  public importWallet(telegramUserId: number, secretInput: string, username?: string): UserWallet {
+    const wallet = this.getOrCreateWallet(telegramUserId, username);
+    const trimmed = secretInput.trim().replace(/\s+/g, ' ');
+    const words = trimmed.split(' ');
+
+    let pk: PrivateKey;
+    let savedMnemonic: string | undefined;
+
+    if (words.length === 12 || words.length === 24) {
+      pk = PrivateKey.fromMnemonic(trimmed);
+      savedMnemonic = trimmed;
+    } else {
+      const cleanHex = trimmed.startsWith('0x') ? trimmed : `0x${trimmed}`;
+      if (!/^0x[0-9a-fA-F]{64}$/.test(cleanHex)) {
+        throw new Error('请输入有效的 12/24 位英文助记词（空格分隔）或 64 位十六进制私钥');
+      }
+      pk = PrivateKey.fromHex(cleanHex);
+      savedMnemonic = undefined;
+    }
+
+    const injectiveAddress = pk.toBech32();
+    const evmAddress = pk.toAddress().toHex();
+    const subaccountId = getSubaccountId(injectiveAddress, 0);
+
+    wallet.injectiveAddress = injectiveAddress;
+    wallet.evmAddress = evmAddress;
+    wallet.subaccountId = subaccountId;
+    wallet.privateKeyHex = pk.toPrivateKeyHex();
+    wallet.mnemonic = savedMnemonic;
+
+    this.saveWallets();
+    return wallet;
   }
 
   /**
@@ -451,30 +807,10 @@ export class WalletService {
   }
 
   /**
-   * 导入已有私钥
+   * 导入已有私钥 (向后兼容，内部调用 importWallet)
    */
   public importPrivateKey(telegramId: number, privateKeyHex: string, username?: string): UserWallet {
-    const cleanPk = privateKeyHex.trim().startsWith('0x') ? privateKeyHex.trim() : `0x${privateKeyHex.trim()}`;
-    const pk = PrivateKey.fromHex(cleanPk);
-    const injectiveAddress = pk.toBech32();
-    const subaccountId = getSubaccountId(injectiveAddress, 0);
-
-    const wallet: UserWallet = {
-      telegramId,
-      username,
-      injectiveAddress,
-      subaccountId,
-      privateKeyHex: cleanPk,
-      createdAt: Date.now(),
-      practiceMode: false,
-      practiceBalanceUsdt: 10000,
-      practicePositions: [],
-      practiceRealizedPnlUsdt: 0,
-    };
-
-    this.wallets.set(telegramId, wallet);
-    this.saveWallets();
-    return wallet;
+    return this.importWallet(telegramId, privateKeyHex, username);
   }
 
   /**

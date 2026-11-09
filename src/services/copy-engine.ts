@@ -53,10 +53,18 @@ export class CopyEngine {
 
     // 2. 获取当前实时盘口价格
     let currentMidPrice = event.price;
+    let currentAsk = event.price;
+    let currentBid = event.price;
     try {
       const obPrices = await this.injectiveService.getOrderbookPrices(event.marketId);
       if (obPrices.midPrice > 0) {
         currentMidPrice = obPrices.midPrice;
+      }
+      if (obPrices.bestAsk > 0) {
+        currentAsk = obPrices.bestAsk;
+      }
+      if (obPrices.bestBid > 0) {
+        currentBid = obPrices.bestBid;
       }
     } catch (e: any) {
       console.warn(`[CopyEngine] ⚠️ 获取盘口实时价失败，降级使用大户成交价作为基准:`, e.message);
@@ -67,6 +75,8 @@ export class CopyEngine {
       event,
       market,
       currentMidPrice,
+      currentAsk,
+      currentBid,
     });
 
     if (!riskResult.passed) {
@@ -85,10 +95,13 @@ export class CopyEngine {
       };
     }
 
+    const realFillPrice = riskResult.fillPrice || riskResult.adjustedPrice;
+
     console.log(`[CopyEngine] ✅ 风控审查通过:`);
     console.log(`  - 跟单方向: ${event.direction}`);
     console.log(`  - 折算数量: ${riskResult.adjustedQuantity}`);
-    console.log(`  - 保护上限价格: $${riskResult.adjustedPrice}`);
+    console.log(`  - 真实盘口成交价 (fillPrice): $${realFillPrice}`);
+    console.log(`  - 链上保护上限价 (adjustedPrice): $${riskResult.adjustedPrice}`);
     console.log(`  - 所需保证金: $${riskResult.calculatedMargin} (${riskResult.leverage}x 杠杆)`);
     console.log(`  - 运行模式: ${this.config.dryRun ? '🧪 DRY_RUN (模拟)' : '🔴 LIVE (真实上链)'}`);
 
@@ -99,7 +112,7 @@ export class CopyEngine {
 
       console.log(`\n=========================================================`);
       console.log(`[CopyEngine] 🎯 风控核算通过 (多用户独立钱包路由模式)！`);
-      console.log(`  - 基准价格: $${riskResult.adjustedPrice} | 基准数量: ${riskResult.adjustedQuantity}`);
+      console.log(`  - 真实成交价: $${realFillPrice} (保护上限: $${riskResult.adjustedPrice}) | 基准数量: ${riskResult.adjustedQuantity}`);
       console.log(`  - 核算耗时: ${latency} ms`);
       console.log(`  - 累计放行单数: ${this.successfulOrdersCount} / ${this.totalOrdersCount}`);
       console.log(`=========================================================\n`);
@@ -111,7 +124,7 @@ export class CopyEngine {
         marketTicker: event.marketTicker,
         direction: event.direction,
         executedQuantity: riskResult.adjustedQuantity,
-        executionPrice: riskResult.adjustedPrice,
+        executionPrice: realFillPrice,
         margin: riskResult.calculatedMargin,
         leverage: riskResult.leverage,
         executionTimeMs: latency,
@@ -145,7 +158,7 @@ export class CopyEngine {
         marketTicker: event.marketTicker,
         direction: event.direction,
         executedQuantity: riskResult.adjustedQuantity,
-        executionPrice: riskResult.adjustedPrice,
+        executionPrice: realFillPrice,
         margin: riskResult.calculatedMargin,
         leverage: riskResult.leverage,
         executionTimeMs: latency,
@@ -160,7 +173,7 @@ export class CopyEngine {
         marketTicker: event.marketTicker,
         direction: event.direction,
         executedQuantity: riskResult.adjustedQuantity,
-        executionPrice: riskResult.adjustedPrice,
+        executionPrice: realFillPrice,
         margin: riskResult.calculatedMargin,
         leverage: riskResult.leverage,
         executionTimeMs: latency,
