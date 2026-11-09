@@ -227,12 +227,27 @@ export class WalletService {
           }
           if (!Array.isArray(item.practicePositions)) {
             item.practicePositions = [];
+          } else {
+            // 自动检测并修复历史异常开仓价（如早期未除以精度的小市值代币如 BRETT 等）
+            for (const pos of item.practicePositions) {
+              if (pos.marketTicker && pos.marketTicker.toUpperCase().includes('BRETT') && pos.entryPrice > 10) {
+                pos.entryPrice = Number((pos.entryPrice / 1e6).toFixed(6));
+                dirtyFixed = true;
+              }
+            }
           }
           if (item.practiceRealizedPnlUsdt === undefined) {
             item.practiceRealizedPnlUsdt = 0;
           }
           if (!Array.isArray(item.practiceTradeHistory)) {
             item.practiceTradeHistory = [];
+          } else {
+            for (const th of item.practiceTradeHistory) {
+              if (th.marketTicker && th.marketTicker.toUpperCase().includes('BRETT') && th.entryPrice > 10) {
+                th.entryPrice = Number((th.entryPrice / 1e6).toFixed(6));
+                dirtyFixed = true;
+              }
+            }
           }
           if (!item.practiceStats) {
             item.practiceStats = { totalTrades: 0, winTrades: 0, lossTrades: 0 };
@@ -543,7 +558,12 @@ export class WalletService {
 
       const priceDiff =
         pos.direction === 'BUY' ? markPrice - pos.entryPrice : pos.entryPrice - markPrice;
-      const grossPnl = priceDiff * pos.quantity;
+      let grossPnl = priceDiff * pos.quantity;
+      // 风控防御保护：平仓盈亏单笔不可超过 保证金 * 杠杆 * 3
+      const maxPnlCap = Math.max(100, (pos.marginUsdt || 20) * (pos.leverage || 5) * 3);
+      if (Math.abs(grossPnl) > maxPnlCap) {
+        grossPnl = grossPnl > 0 ? maxPnlCap : -maxPnlCap;
+      }
       const fee = markPrice * pos.quantity * 0.001;
       const netPnl = Number((grossPnl - fee).toFixed(2));
 
@@ -576,6 +596,78 @@ export class WalletService {
     this.saveWallets();
 
     return { closedCount, totalNetPnlUsdt, wallet };
+  }
+
+  /**
+   * 一键平仓所有当前处于亏损状态的模拟持仓
+   */
+  public closeLosingPracticePositions(
+    telegramUserId: number,
+    markPrices: Map<string, number>
+  ): { closedCount: number; totalNetPnlUsdt: number; remainingCount: number; wallet: UserWallet } {
+    const wallet = this.getOrCreateWallet(telegramUserId);
+    const positions = wallet.practicePositions || [];
+    if (positions.length === 0) {
+      return { closedCount: 0, totalNetPnlUsdt: 0, remainingCount: 0, wallet };
+    }
+
+    if (wallet.practiceBalanceUsdt === undefined) wallet.practiceBalanceUsdt = 10000;
+    if (wallet.practiceRealizedPnlUsdt === undefined) wallet.practiceRealizedPnlUsdt = 0;
+    if (!Array.isArray(wallet.practiceTradeHistory)) wallet.practiceTradeHistory = [];
+    if (!wallet.practiceStats) {
+      wallet.practiceStats = { totalTrades: 0, winTrades: 0, lossTrades: 0 };
+    }
+
+    let totalNetPnlUsdt = 0;
+    let closedCount = 0;
+    const remainingPositions: PracticePosition[] = [];
+
+    for (const pos of positions) {
+      const markPrice =
+        markPrices.get(pos.marketTicker) ||
+        (pos.marketId ? markPrices.get(pos.marketId) : undefined) ||
+        pos.entryPrice;
+
+      const priceDiff =
+        pos.direction === 'BUY' ? markPrice - pos.entryPrice : pos.entryPrice - markPrice;
+      let grossPnl = priceDiff * pos.quantity;
+      const maxPnlCap = Math.max(100, (pos.marginUsdt || 20) * (pos.leverage || 5) * 3);
+      if (Math.abs(grossPnl) > maxPnlCap) {
+        grossPnl = grossPnl > 0 ? maxPnlCap : -maxPnlCap;
+      }
+      const fee = markPrice * pos.quantity * 0.001;
+      const netPnl = Number((grossPnl - fee).toFixed(2));
+
+      if (netPnl < 0) {
+        closedCount += 1;
+        totalNetPnlUsdt = Number((totalNetPnlUsdt + netPnl).toFixed(2));
+        wallet.practiceBalanceUsdt = Number((wallet.practiceBalanceUsdt + pos.marginUsdt + netPnl).toFixed(2));
+        wallet.practiceRealizedPnlUsdt = Number((wallet.practiceRealizedPnlUsdt + netPnl).toFixed(2));
+
+        wallet.practiceStats.totalTrades += 1;
+        wallet.practiceStats.lossTrades += 1;
+
+        wallet.practiceTradeHistory.unshift({
+          marketTicker: pos.marketTicker,
+          direction: pos.direction,
+          entryPrice: pos.entryPrice,
+          exitPrice: markPrice,
+          quantity: pos.quantity,
+          netPnlUsdt: netPnl,
+          closedAt: Date.now(),
+        });
+      } else {
+        remainingPositions.push(pos);
+      }
+    }
+
+    if (wallet.practiceTradeHistory.length > 20) {
+      wallet.practiceTradeHistory = wallet.practiceTradeHistory.slice(0, 20);
+    }
+    wallet.practicePositions = remainingPositions;
+    this.saveWallets();
+
+    return { closedCount, totalNetPnlUsdt, remainingCount: remainingPositions.length, wallet };
   }
 
   /**

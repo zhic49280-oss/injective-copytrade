@@ -325,29 +325,40 @@ ${balanceDisplay}
     let totalUnrealizedPnlUsdt = 0;
     let totalUsedMargin = 0;
 
-    const positionLines: string[] = [];
+    const positionCards: string[] = [];
     for (const pos of positions) {
       const curPrice = markPriceMap.get(pos.marketTicker) || pos.entryPrice;
       const priceDiff = pos.direction === 'BUY' ? curPrice - pos.entryPrice : pos.entryPrice - curPrice;
-      const uPnl = Number((priceDiff * pos.quantity).toFixed(2));
+      let rawPnl = priceDiff * pos.quantity;
+      // 风控防御保护：单笔持仓未实现浮盈浮亏不可超过 保证金 * 杠杆 * 3，防止历史坏数据污染整个看板
+      const maxPnlCap = Math.max(100, (pos.marginUsdt || 20) * (pos.leverage || 5) * 3);
+      if (Math.abs(rawPnl) > maxPnlCap) {
+        rawPnl = rawPnl > 0 ? maxPnlCap : -maxPnlCap;
+      }
+      const uPnl = Number(rawPnl.toFixed(2));
       const uRoi = pos.marginUsdt > 0 ? ((uPnl / pos.marginUsdt) * 100).toFixed(2) : '0.00';
       const sign = uPnl >= 0 ? '+' : '';
+      const pnlEmoji = uPnl >= 0 ? '🟢' : '🔴';
+      const dirEmoji = pos.direction === 'BUY' ? '🟢' : '🔴';
+      const dirText = pos.direction === 'BUY' ? '多 (LONG)' : '空 (SHORT)';
       totalUnrealizedPnlUsdt = Number((totalUnrealizedPnlUsdt + uPnl).toFixed(2));
       totalUsedMargin = Number((totalUsedMargin + pos.marginUsdt).toFixed(2));
 
-      const dirBadge = pos.direction === 'BUY' ? '🟢 做多 (LONG)' : '🔴 做空 (SHORT)';
-      positionLines.push(
-        `📌 <b>${pos.marketTicker}</b> | ${dirBadge} ${pos.leverage}x\n` +
-          `   • 持仓数量: <code>${pos.quantity}</code> | 占用保证金: <b>$${pos.marginUsdt.toFixed(2)} USDT</b>\n` +
-          `   • 开仓均价: <b>$${pos.entryPrice}</b> ➔ 标记现价: <b>$${curPrice}</b>\n` +
-          `   • 实时浮盈: <b>${sign}$${uPnl.toFixed(2)} USDT (${sign}${uRoi}%)</b>`
+      const notionalUsd = (curPrice * pos.quantity).toFixed(2);
+      const cleanTicker = pos.marketTicker.replace('/USDC PERP', '').replace('/USDT PERP', '');
+
+      positionCards.push(
+        `┌── ${dirEmoji} <b>${cleanTicker}</b> (<code>${pos.leverage}x ${dirText}</code>)\n` +
+          `│ 浮动盈亏: ${pnlEmoji} <b>${sign}$${uPnl.toFixed(2)} USDT (${sign}${uRoi}%)</b>\n` +
+          `│ 仓位价值: <b>$${notionalUsd}</b> | 保证金: <b>$${pos.marginUsdt.toFixed(2)} USDT</b>\n` +
+          `│ 开仓均价: <code>$${pos.entryPrice}</code> ➔ 现价: <code>$${curPrice}</code>\n` +
+          `└──────────────────────────`
       );
     }
 
     const availBalance = isPractice ? (userWallet.practiceBalanceUsdt ?? 10000) : 0;
     const totalEquity = Number((availBalance + totalUsedMargin + totalUnrealizedPnlUsdt).toFixed(2));
     const realizedPnl = userWallet.practiceRealizedPnlUsdt ?? 0;
-    const netPnl = Number((realizedPnl + totalUnrealizedPnlUsdt).toFixed(2));
     const totalRoi = (((totalEquity - 10000) / 10000) * 100).toFixed(2);
     const pStats = userWallet.practiceStats || { totalTrades: 0, winTrades: 0, lossTrades: 0 };
     const winRate =
@@ -356,12 +367,17 @@ ${balanceDisplay}
     const uSign = totalUnrealizedPnlUsdt >= 0 ? '+' : '';
     const rSign = realizedPnl >= 0 ? '+' : '';
     const roiSign = parseFloat(totalRoi) >= 0 ? '+' : '';
+    const uEmoji = totalUnrealizedPnlUsdt >= 0 ? '🟢' : '🔴';
+    const rEmoji = realizedPnl >= 0 ? '🟢' : '🔴';
+    const roiEmoji = parseFloat(totalRoi) >= 0 ? '🟢' : '🔴';
 
     const historyItems = (userWallet.practiceTradeHistory || []).slice(0, 4);
     const historyLines = historyItems.map((h) => {
       const hSign = h.netPnlUsdt >= 0 ? '+' : '';
-      const hDir = h.direction === 'BUY' ? '🟢多' : '🔴空';
-      return `  • ${hDir} <b>${h.marketTicker}</b>: 开 $${h.entryPrice} ➔ 平 $${h.exitPrice} | 净盈亏: <b>${hSign}$${h.netPnlUsdt.toFixed(2)} USDT</b>`;
+      const hEmoji = h.netPnlUsdt >= 0 ? '🟢' : '🔴';
+      const hDir = h.direction === 'BUY' ? '多' : '空';
+      const cleanH = h.marketTicker.replace('/USDC PERP', '').replace('/USDT PERP', '');
+      return `  • ${hEmoji} <b>${cleanH} (${hDir})</b>: 开 $${h.entryPrice} ➔ 平 $${h.exitPrice} | 盈亏: <b>${hSign}$${h.netPnlUsdt.toFixed(2)} USDT</b>`;
     });
 
     const execModeDesc = isPractice
@@ -369,11 +385,11 @@ ${balanceDisplay}
       : '🔴 实盘链上交易 (专属钱包私钥真实签名上链)';
 
     const maxDisplay = 5;
-    const displayedPositions = positionLines.slice(0, maxDisplay);
+    const displayedPositions = positionCards.slice(0, maxDisplay);
     let positionsBlock =
       displayedPositions.length > 0 ? displayedPositions.join('\n\n') : '  ⚪ 暂无活动持仓 (等待巨鲸开仓触发)';
     if (positions.length > maxDisplay) {
-      positionsBlock += `\n\n<i>... 另外还有 ${positions.length - maxDisplay} 笔持仓已为您按标的自动汇总净值与浮盈，轻点下方【⚡ 一键市价全平】可全部结算</i>`;
+      positionsBlock += `\n\n<i>... 另外还有 ${positions.length - maxDisplay} 笔持仓已为您按标的自动汇总净值与浮盈，轻点下方按钮可一键全部结算或清理亏损仓位</i>`;
     }
 
     let text = `
@@ -382,14 +398,15 @@ ${balanceDisplay}
 • <b>执行引擎模式</b>: <b>${execModeDesc}</b>
 • <b>跟单巨鲸矩阵</b>: <b>${targetDisplay}</b>
 
-💰 <b>账户财务核心指标:</b>
-• <b>账户总净值 (Equity)</b>: <b>$${totalEquity.toFixed(2)} USDT</b>
-• <b>剩余可用余额</b>: <b>$${availBalance.toFixed(2)} USDT</b>
-• <b>持仓占用保证金</b>: <b>$${totalUsedMargin.toFixed(2)} USDT</b>
-• <b>未平仓实时浮盈</b>: <b>${uSign}$${totalUnrealizedPnlUsdt.toFixed(2)} USDT</b>
-• <b>累计已实现平仓盈亏</b>: <b>${rSign}$${realizedPnl.toFixed(2)} USDT</b>
-• <b>综合总收益率 (ROI)</b>: <b>${roiSign}${totalRoi}%</b>
-• <b>平仓胜率 (Win Rate)</b>: <b>${winRate}%</b> (${pStats.winTrades}胜 / ${pStats.lossTrades}负)
+┌── 💰 <b>账户财务核心资产看板</b> ─────────
+│ 💎 账户总净值 (Equity): <b>$${totalEquity.toFixed(2)} USDT</b>
+│ 💵 体验金可用余额: <b>$${availBalance.toFixed(2)} USDT</b>
+│ 🔒 持仓占用保证金: <b>$${totalUsedMargin.toFixed(2)} USDT</b> (${positions.length} 笔持仓)
+│ 📈 实时未平仓浮盈: ${uEmoji} <b>${uSign}$${totalUnrealizedPnlUsdt.toFixed(2)} USDT</b>
+│ 📉 累计已平仓盈亏: ${rEmoji} <b>${rSign}$${realizedPnl.toFixed(2)} USDT</b>
+│ 🚀 综合收益率 (ROI): ${roiEmoji} <b>${roiSign}${totalRoi}%</b>
+│ 🎯 平仓胜率 (Win Rate): <b>${winRate}%</b> (${pStats.winTrades}胜 / ${pStats.lossTrades}负)
+└────────────────────────────
 
 📈 <b>当前正在运行中的持仓 (${positions.length} 笔):</b>
 ${positionsBlock}
@@ -409,7 +426,10 @@ ${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记�
     const keyboard = new InlineKeyboard().text('🔄 刷新实时浮盈与现价', 'view_stats').row();
 
     if (positions.length > 0) {
-      keyboard.text(`⚡ 一键市价全平 (${positions.length} 笔持仓)`, 'close_all_pos').row();
+      keyboard
+        .text(`⚡ 一键市价全平 (${positions.length} 仓)`, 'close_all_pos')
+        .text('🧹 仅平仓亏损仓位', 'close_loss_pos')
+        .row();
     }
 
     keyboard
@@ -434,12 +454,14 @@ ${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记�
       const briefText = `
 📊 <b>【跟单账户实时资产概览】</b>
 
-• 账户总净值: <b>$${totalEquity.toFixed(2)} USDT</b>
-• 剩余可用体验金: <b>$${availBalance.toFixed(2)} USDT</b>
-• 持仓占用保证金: <b>$${totalUsedMargin.toFixed(2)} USDT (${positions.length} 笔持仓)</b>
-• 实时未平仓浮盈: <b>${uSign}$${totalUnrealizedPnlUsdt.toFixed(2)} USDT</b>
-• 累计已实现盈亏: <b>${rSign}$${realizedPnl.toFixed(2)} USDT</b>
-• 综合总收益率: <b>${roiSign}${totalRoi}%</b>
+┌── 💰 <b>核心资产数据</b> ─────────
+│ 💎 账户总净值: <b>$${totalEquity.toFixed(2)} USDT</b>
+│ 💵 体验金可用余额: <b>$${availBalance.toFixed(2)} USDT</b>
+│ 🔒 占用保证金: <b>$${totalUsedMargin.toFixed(2)} USDT</b> (${positions.length} 笔持仓)
+│ 📈 实时总浮盈: ${uEmoji} <b>${uSign}$${totalUnrealizedPnlUsdt.toFixed(2)} USDT</b>
+│ 📉 累计已平仓: ${rEmoji} <b>${rSign}$${realizedPnl.toFixed(2)} USDT</b>
+│ 🚀 综合收益率: ${roiEmoji} <b>${roiSign}${totalRoi}%</b>
+└────────────────────────────
 
 💡 <i>当前持仓较多 (${positions.length} 笔)，建议轻点下方按钮【⚡ 一键市价全平】结算持仓，或【🔄 重置 $10,000 体验金】。</i>
       `.trim();
@@ -1407,6 +1429,46 @@ ${targetsLines}
           `⚡ 已全平 ${res.closedCount} 笔持仓，本次结算净盈亏: ${sign}$${res.totalNetPnlUsdt} USDT`
         )
         .catch(() => {});
+      await this.renderPortfolioAndStats(ctx, true);
+    });
+
+    // 一键仅平仓亏损持仓
+    this.bot.callbackQuery('close_loss_pos', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      const injService = this.copyEngine.getInjectiveService();
+      const userWallet = this.walletService.getOrCreateWallet(userId);
+      const positions = userWallet.practicePositions || [];
+      const markPriceMap = new Map<string, number>();
+
+      await Promise.all(
+        positions.map(async (pos) => {
+          try {
+            const ob = await injService.getOrderbook(pos.marketId || pos.marketTicker, pos.marketTicker);
+            const p =
+              pos.direction === 'BUY'
+                ? ob.bestBid > 0
+                  ? ob.bestBid
+                  : ob.midPrice
+                : ob.bestAsk > 0
+                ? ob.bestAsk
+                : ob.midPrice;
+            if (p > 0) markPriceMap.set(pos.marketTicker, p);
+          } catch {
+            markPriceMap.set(pos.marketTicker, pos.entryPrice);
+          }
+        })
+      );
+
+      const res = this.walletService.closeLosingPracticePositions(userId, markPriceMap);
+      if (res.closedCount === 0) {
+        await ctx.answerCallbackQuery('当前暂无处于亏损状态的持仓').catch(() => {});
+      } else {
+        await ctx
+          .answerCallbackQuery(
+            `🧹 已清理 ${res.closedCount} 笔亏损仓位，剩余 ${res.remainingCount} 笔持仓`
+          )
+          .catch(() => {});
+      }
       await this.renderPortfolioAndStats(ctx, true);
     });
 
