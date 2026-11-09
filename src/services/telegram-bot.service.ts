@@ -470,6 +470,95 @@ ${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记�
   }
 
   /**
+   * 渲染用户专属 Injective 钱包详情面板 (支持链上余额实时刷新与提示反馈)
+   */
+  public async renderWalletDetail(ctx: any, isEdit: boolean = true, isRefresh: boolean = false) {
+    const userId = ctx.from?.id || 0;
+    const userWallet = this.walletService.getOrCreateWallet(userId, ctx.from?.username);
+
+    // 如果是通过 callbackQuery 触发，第一时间应答以取消前端按钮 loading 转圈并提供即时反馈
+    if (ctx.callbackQuery) {
+      if (isRefresh) {
+        await ctx.answerCallbackQuery('正在查询 Injective 链上最新资产...').catch(() => {});
+      } else {
+        await ctx.answerCallbackQuery().catch(() => {});
+      }
+    }
+
+    const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
+    const isPractice = this.walletService.isPracticeMode(userId);
+    const positions = userWallet.practicePositions || [];
+    const usedMargin = positions.reduce((sum, p) => sum + (p.marginUsdt || 0), 0);
+    const availPractice = userWallet.practiceBalanceUsdt ?? 10000;
+    const realizedPnl = userWallet.practiceRealizedPnlUsdt ?? 0;
+    const pnlSign = realizedPnl >= 0 ? '+' : '';
+
+    const practiceInfo = isPractice
+      ? `• <b>当前执行模式</b>: <b>【🧪 模拟盘演练 (虚拟体验金扣款，不上链不耗 Gas)】</b>\n• <b>剩余可用体验金</b>: <b>$${availPractice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT</b>\n• <b>模拟持仓占用保证金</b>: <b>$${usedMargin.toFixed(2)} USDT (${positions.length} 笔持仓)</b>\n• <b>累计平仓已实现盈亏</b>: <b>${pnlSign}$${realizedPnl.toFixed(2)} USDT</b>`
+      : `• <b>当前执行模式</b>: <b>【🔴 实盘链上交易模式 (专属钱包私钥签名上链)】</b>`;
+
+    const hasMnemonic = Boolean(userWallet.mnemonic);
+    const refreshTime = new Date().toLocaleTimeString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' });
+
+    const text = `
+👛 <b>我的专属 Injective 跟单钱包</b>
+
+• <b>专属链上地址</b>:
+<code>${userWallet.injectiveAddress}</code>
+<i>(轻点上方地址可直接复制)</i>
+
+• <b>EVM 映射地址</b>: <code>${userWallet.evmAddress || 'N/A'}</code>
+• <b>助记词备份状态</b>: <b>${hasMnemonic ? '✅ 已生成 12 位标准 BIP39 助记词' : '⚠️ 早期私钥 (建议升级为助记词)'}</b>
+
+┌── 📊 <b>链上真实资产与模式详情</b> ─────────
+│ 💎 <b>链上 INJ 余额</b>: <code>${balances.inj} INJ</code>
+│ 💵 <b>链上 USDT 余额</b>: <code>${balances.usdt} USDT</code>
+│ 💰 <b>当前实盘总估值</b>: <b>$${balances.totalUsd} USD</b>
+│ 🕒 <b>数据同步时间</b>: <code>${refreshTime} (UTC+8)</code>
+└────────────────────────────
+${practiceInfo}
+
+🛡️ <b>真实 Web3 非托管钱包保障:</b>
+<i>该钱包由 @injectivelabs/sdk-ts 密码学库在本地派生生成，是 100% 链上真实存在的 Injective/Cosmos 地址。您可随时导出助记词或私钥到 Keplr、OKX Web3 钱包查验，亦可直接导入您已有的钱包！</i>
+    `.trim();
+
+    const keyboard = new InlineKeyboard()
+      .text('📈 查看持仓与盈亏明细', 'view_stats')
+      .row()
+      .text('💳 充值 USDT/INJ 激活实盘', 'deposit_guide')
+      .row()
+      .text('🔴 切换为：实盘链上交易模式', 'switch_mode_real')
+      .text('🧪 切换为：$10,000 模拟演练模式', 'switch_mode_practice')
+      .row()
+      .text('🔄 刷新余额', 'refresh_wallet')
+      .text('🔑 导出助记词/私钥', 'export_key')
+      .row()
+      .text('📥 导入外部助记词/私钥', 'import_wallet_prompt')
+      .text('🔄 重新生成助记词钱包', 'regen_wallet')
+      .row()
+      .url('🌐 在 Injective 区块浏览器查验', `https://injscan.com/account/${userWallet.injectiveAddress}`)
+      .row()
+      .text('🔙 返回主菜单', 'back_to_menu');
+
+    if (isEdit) {
+      try {
+        await ctx.editMessageText(text, {
+          parse_mode: 'HTML',
+          reply_markup: keyboard,
+        });
+        return;
+      } catch (err: any) {
+        if (!err.message?.includes('message is not modified')) {
+          console.warn('[TelegramBot] renderWalletDetail edit 失败，尝试以新消息回复:', err.message);
+          await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
+        }
+      }
+    } else {
+      await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
+    }
+  }
+
+  /**
    * 统一渲染主控制面板 (支持 reply 或 editMessageText)
    */
   public async renderMainMenu(ctx: any, isEdit: boolean = false) {
@@ -649,6 +738,7 @@ ${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记�
     });
 
     this.bot.command('stats', (ctx) => this.renderPortfolioAndStats(ctx, false));
+    this.bot.command('wallet', (ctx) => this.renderWalletDetail(ctx, false, false));
 
     // 3. 文本输入监听 (区分等待输入自定义钱包、等待输入助记词/私钥导入与普通发送地址)
     this.bot.on('message:text', async (ctx) => {
@@ -851,66 +941,10 @@ ${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记�
       await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
     });
 
-    // 钱包详情与充值
-    this.bot.callbackQuery('view_wallet', async (ctx) => {
-      const userId = ctx.from?.id || 0;
-      const userWallet = this.walletService.getOrCreateWallet(userId, ctx.from?.username);
-      const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
-      const isPractice = this.walletService.isPracticeMode(userId);
-      const positions = userWallet.practicePositions || [];
-      const usedMargin = positions.reduce((sum, p) => sum + (p.marginUsdt || 0), 0);
-      const availPractice = userWallet.practiceBalanceUsdt ?? 10000;
-      const realizedPnl = userWallet.practiceRealizedPnlUsdt ?? 0;
-      const pnlSign = realizedPnl >= 0 ? '+' : '';
-
-      const practiceInfo = isPractice
-        ? `• <b>当前执行模式</b>: <b>【🧪 模拟盘演练 (虚拟体验金扣款，不上链不耗 Gas)】</b>\n• <b>剩余可用体验金</b>: <b>$${availPractice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT</b>\n• <b>模拟持仓占用保证金</b>: <b>$${usedMargin.toFixed(2)} USDT (${positions.length} 笔持仓)</b>\n• <b>累计平仓已实现盈亏</b>: <b>${pnlSign}$${realizedPnl.toFixed(2)} USDT</b>`
-        : `• <b>当前执行模式</b>: <b>【🔴 实盘链上交易模式 (专属钱包私钥签名上链)】</b>`;
-
-      const hasMnemonic = Boolean(userWallet.mnemonic);
-
-      const text = `
-👛 <b>我的专属 Injective 跟单钱包</b>
-
-• <b>专属链上地址</b>:
-<code>${userWallet.injectiveAddress}</code>
-<i>(轻点上方地址可直接复制)</i>
-
-• <b>EVM 映射地址</b>: <code>${userWallet.evmAddress || 'N/A'}</code>
-• <b>助记词备份状态</b>: <b>${hasMnemonic ? '✅ 已生成 12 位标准 BIP39 助记词' : '⚠️ 早期私钥 (建议升级为助记词)'}</b>
-
-📊 <b>资产与模式详情</b>:
-• <b>链上 INJ 余额</b>: <code>${balances.inj} INJ</code>
-• <b>链上 USDT 余额</b>: <code>${balances.usdt} USDT</code>
-• <b>当前实盘估值</b>: <b>$${balances.totalUsd} USD</b>
-${practiceInfo}
-
-🛡️ <b>真实 Web3 非托管钱包保障:</b>
-<i>该钱包由 @injectivelabs/sdk-ts 密码学库在本地派生生成，是 100% 链上真实存在的 Injective/Cosmos 地址。您可随时导出助记词或私钥到 Keplr、OKX Web3 钱包查验，亦可直接导入您已有的钱包！</i>
-      `.trim();
-
-      const keyboard = new InlineKeyboard()
-        .text('📈 查看持仓与盈亏明细', 'view_stats')
-        .row()
-        .text('💳 充值 USDT/INJ 激活实盘', 'deposit_guide')
-        .row()
-        .text('🔴 切换为：实盘链上交易模式', 'switch_mode_real')
-        .text('🧪 切换为：$10,000 模拟演练模式', 'switch_mode_practice')
-        .row()
-        .text('🔄 刷新余额', 'view_wallet')
-        .text('🔑 导出助记词/私钥', 'export_key')
-        .row()
-        .text('📥 导入外部助记词/私钥', 'import_wallet_prompt')
-        .text('🔄 重新生成助记词钱包', 'regen_wallet')
-        .row()
-        .url('🌐 在 Injective 区块浏览器查验', `https://injscan.com/account/${userWallet.injectiveAddress}`)
-        .row()
-        .text('🔙 返回主菜单', 'back_to_menu');
-
-      await ctx.editMessageText(text, {
-        parse_mode: 'HTML',
-        reply_markup: keyboard,
-      });
+    // 钱包详情与余额刷新 (支持即时反馈与最新时间戳展示)
+    this.bot.callbackQuery(['view_wallet', 'refresh_wallet'], async (ctx) => {
+      const isRefresh = ctx.callbackQuery?.data === 'refresh_wallet';
+      await this.renderWalletDetail(ctx, true, isRefresh);
     });
 
     // 充值指南

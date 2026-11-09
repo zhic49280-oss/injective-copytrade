@@ -409,7 +409,7 @@ async function runSimulation() {
   };
 
   tracker.emitManualEvent(normalEvent);
-  await new Promise((r) => setTimeout(r, 600));
+  await new Promise((r) => setTimeout(r, 1200));
 
   // 6.2 异常滑点信号 (偏离 20%)
   const slippageEvent: SmartMoneyTradeEvent = {
@@ -427,7 +427,7 @@ async function runSimulation() {
   };
 
   tracker.emitManualEvent(slippageEvent);
-  await new Promise((r) => setTimeout(r, 600));
+  await new Promise((r) => setTimeout(r, 1200));
 
   console.log(`   - 正常跟单成功笔数: ${executionSuccessCount} (预期 1)`);
   console.log(`   - 风控拦截笔数:     ${riskBlockedCount} (预期 1)`);
