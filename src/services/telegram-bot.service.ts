@@ -25,11 +25,11 @@ export function validateInjectiveAddress(addr: string): { valid: boolean; error?
   try {
     const parsed = Address.fromBech32(clean);
     if (parsed.toBech32() !== clean) {
-      return { valid: false, error: 'Bech32 校验和不匹配。' };
+      return { valid: false, error: '地址校验和不匹配，请核对地址是否输入完整。' };
     }
     return { valid: true, cleanAddress: clean };
   } catch (err: any) {
-    return { valid: false, error: `Bech32 校验失败: ${err.message || '无效的校验和'}` };
+    return { valid: false, error: `地址安全校验未通过: ${err.message || '无效的钱包地址'}` };
   }
 }
 
@@ -253,7 +253,7 @@ ${balanceDisplay}
 • <b>单笔金额</b>: <b>$${userCopy.copyAmountUsdt} USDT/单</b>
 • <b>运行状态</b>: <b>${modeText}</b>
 • <b>风控保护</b>: 杠杆 <b>${this.config.maxLeverage}x</b> | 滑点保护 <b>${this.config.maxSlippagePercent}%</b>
-• <b>链路响应</b>: 🟢 gRPC 毫秒级流式监听 24h 待命
+• <b>响应延迟</b>: 🟢 毫秒级极速响应 24h 待命
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 👇 <b>请在下方轻点按钮进行操作:</b>
     `.trim();
@@ -283,8 +283,8 @@ ${balanceDisplay}
 • 累计捕获巨鲸信号: <b>${stats.total} 笔</b>
 • 自动跟单成功执行: <b>${stats.success} 笔</b>
 • 风控拦截异常滑点: <b>${stats.total - stats.success} 笔</b>
-• 平均链上执行延迟: <b>~380 ms (亚秒级)</b>
-• 节点连接状态: <b>🟢 Injective Mainnet Sentry 正常</b>
+• 平均链上执行延迟: <b>~380 ms (极速响应)</b>
+• 网络运行状态: <b>🟢 Injective 主网正常</b>
     `.trim();
   }
 
@@ -426,7 +426,7 @@ ${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记�
 
 ⚡ <b>信号引擎指标:</b>
 • 累计捕获信号: <b>${engineStats.total} 笔</b> | 放行跟单: <b>${engineStats.success} 笔</b> | 风控拦截: <b>${engineStats.total - engineStats.success} 笔</b>
-• 执行延迟: <b>~380 ms</b> | 节点: <b>🟢 Injective Mainnet Sentry</b>
+• 执行延迟: <b>~380 ms</b> | 网络状态: <b>🟢 Injective 主网极速连接</b>
     `.trim();
 
     if (text.length > 3800) {
@@ -518,7 +518,7 @@ ${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记�
 <i>(轻点上方地址可直接复制)</i>
 
 • <b>EVM 映射地址</b>: <code>${userWallet.evmAddress || 'N/A'}</code>
-• <b>助记词备份状态</b>: <b>${hasMnemonic ? '✅ 已生成 12 位标准 BIP39 助记词' : '⚠️ 早期私钥 (建议升级为助记词)'}</b>
+• <b>助记词备份状态</b>: <b>${hasMnemonic ? '✅ 已生成 12 位标准安全助记词' : '⚠️ 早期私钥 (建议升级为助记词)'}</b>
 
 ┌── 📊 <b>链上真实资产与模式详情</b> ─────────
 │ 💎 <b>链上 INJ 余额</b>: <code>${balances.inj} INJ</code>
@@ -529,7 +529,7 @@ ${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记�
 ${practiceInfo}
 
 🛡️ <b>真实 Web3 非托管钱包保障:</b>
-<i>该钱包由 @injectivelabs/sdk-ts 密码学库在本地派生生成，是 100% 链上真实存在的 Injective/Cosmos 地址。您可随时导出助记词或私钥到 Keplr、OKX Web3 钱包查验，亦可直接导入您已有的钱包！</i>
+<i>该钱包基于行业标准密码学算法在本地安全生成，是 100% 链上真实存在的独立非托管地址。您可随时导出助记词或私钥到 Keplr、OKX Web3 钱包查验管理，资产完全由您掌控！</i>
     `.trim();
 
     const keyboard = new InlineKeyboard()
@@ -735,11 +735,11 @@ ${practiceInfo}
       const text = `
 🔍 <b>【请输入您要监控并跟单的 Injective 钱包地址】</b>
 
-请输入以 <code>inj1...</code> 开头的 42 位 Injective Bech32 地址：
+请输入以 <code>inj1...</code> 开头的 42 位 Injective 钱包地址：
 例如：
 <code>inj1zd8e0mh95hle4l5y2n8ts94pkkzq25vg8aj0xp</code>
 
-⚡ <i>系统将进行 Bech32 链上校验码严密校验，并自动加入您的多巨鲸跟单矩阵！</i>
+⚡ <i>系统将自动进行地址安全校验，并一键加入您的多巨鲸跟单矩阵！</i>
       `.trim();
 
       const keyboard = new InlineKeyboard().text('🔙 返回主菜单', 'back_to_menu');
@@ -875,7 +875,7 @@ ${practiceInfo}
 例如：
 <code>inj1zd8e0mh95hle4l5y2n8ts94pkkzq25vg8aj0xp</code>
 
-💡 <i>支持同时监控最多 5 位巨鲸！系统将自动校验 Bech32 Checksum 并加入您的多巨鲸并发跟单矩阵，绝不覆盖已有目标！</i>
+💡 <i>支持同时监控最多 5 位巨鲸！系统将自动安全校验地址格式并加入您的多巨鲸并发跟单矩阵，绝不覆盖已有目标！</i>
       `.trim();
 
       const keyboard = new InlineKeyboard().text('🔙 返回主菜单', 'back_to_menu');
@@ -1070,7 +1070,7 @@ ${practiceInfo}
       const userWallet = this.walletService.getOrCreateWallet(userId, ctx.from?.username);
 
       const mnemonicBlock = userWallet.mnemonic
-        ? `• <b>12 位标准 BIP39 英文助记词:</b>\n<code>${userWallet.mnemonic}</code>\n<i>(轻点上方助记词可直接复制。可直接导入 Keplr、OKX Web3 钱包、MetaMask 或 Leap 验证同一链上地址！)</i>`
+        ? `• <b>12 位标准英文助记词:</b>\n<code>${userWallet.mnemonic}</code>\n<i>(轻点上方助记词可直接复制。可直接导入 Keplr、OKX Web3 钱包、MetaMask 或 Leap 验证同一链上地址！)</i>`
         : `• <b>12 位助记词:</b>\n<i>⚠️ 此钱包系早期创建，未生成 12 位助记词。建议点击下方【🔄 升级为全新助记词钱包】生成带助记词的新钱包。</i>`;
 
       const text = `
@@ -1085,7 +1085,7 @@ ${mnemonicBlock}
 <code>${userWallet.privateKeyHex}</code>
 
 🛡️ <b>关于非托管去中心化钱包的安全说明:</b>
-1. <b>真实链上钱包</b>: 该地址是通过 Injective 官方标准算法（BIP39 + EthSecp256k1）本地派生生成的 100% 真实 Web3 钱包，与其他主流 Telegram 机器人（如 GMGN、Banana Gun、Trojan、OKX Web3）原理完全一致。
+1. <b>真实链上钱包</b>: 该地址遵循 Injective 官方密码学标准在本地安全生成，是 100% 真实 Web3 独立钱包，与其他主流 Telegram 交易机器人（如 GMGN、Banana Gun、OKX Web3）原理完全一致。
 2. <b>随时导出查验</b>: 您可以随时将助记词或私钥导入到 Keplr 或 OKX Web3 钱包中验证，地址和资产分毫不差。
 3. <b>最高控制权</b>: 任何拥有助记词或私钥的人都拥有该钱包的所有权，切勿截图或发送给任何人！
       `.trim();
@@ -1109,7 +1109,7 @@ ${mnemonicBlock}
       const newWallet = this.walletService.regenerateWalletWithMnemonic(userId);
       await ctx.answerCallbackQuery('🎉 已生成带 12 位助记词的全新钱包！').catch(() => {});
 
-      const mnemonicBlock = `• <b>12 位标准 BIP39 英文助记词:</b>\n<code>${newWallet.mnemonic}</code>\n<i>(轻点上方助记词可直接复制。可直接导入 Keplr、OKX Web3 钱包、MetaMask 或 Leap 验证同一链上地址！)</i>`;
+      const mnemonicBlock = `• <b>12 位标准英文助记词:</b>\n<code>${newWallet.mnemonic}</code>\n<i>(轻点上方助记词可直接复制。可直接导入 Keplr、OKX Web3 钱包、MetaMask 或 Leap 验证同一链上地址！)</i>`;
       const text = `
 🎉 <b>【全新 12 位标准助记词钱包已生成】</b>
 

@@ -534,10 +534,10 @@ async function runSimulation() {
 
   // --- 测试用例 8: 裂变邀请返佣全链路记账、动态收益看板与提现机制 ---
   console.log('\n[8/8] 验证裂变邀请返佣 (Referral System) 全链路自动记账与提现结算...');
-  const inviterId = 888888;
-  const inviteeId = 999999;
+  const inviterId = Date.now() % 1000000 + 100000;
+  const inviteeId = inviterId + 1;
 
-  // 1. 模拟好友通过专属推广链接 /start ref_888888 绑定邀请关系
+  // 1. 模拟好友通过专属推广链接 /start ref_<inviterId> 绑定邀请关系
   const bindSuccess = walletService.bindReferrer(inviteeId, inviterId);
   const duplicateBind = walletService.bindReferrer(inviteeId, 777777); // 尝试重复绑定或篡改
   const selfBind = walletService.bindReferrer(inviterId, inviterId); // 尝试绑定自己
