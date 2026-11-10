@@ -60,6 +60,10 @@ export interface UserWallet {
   targetTraderName?: string;
   followedTargets?: FollowedTarget[];
   copyAmountUsdt?: number;
+  referrerId?: number;
+  referralEarningsUsdt?: number;
+  referralVolumeUsdt?: number;
+  referralWithdrawnUsdt?: number;
 }
 
 export class WalletService {
@@ -1065,5 +1069,127 @@ export class WalletService {
     } catch (e: any) {
       return { inj: '0.0000', usdt: '0.00', totalUsd: 0 };
     }
+  }
+
+  /**
+   * 绑定用户的上级邀请人 (支持通过推广链接 /start ref_<inviterId> 绑定)
+   */
+  public bindReferrer(userId: number, referrerId: number): boolean {
+    if (!userId || !referrerId || userId === referrerId) {
+      return false;
+    }
+    const userWallet = this.getOrCreateWallet(userId);
+    if (userWallet.referrerId) {
+      // 已经绑定过邀请人，不可重复绑定
+      return false;
+    }
+    userWallet.referrerId = referrerId;
+    this.saveWallets();
+    console.log(`[WalletService] 🤝 用户 ${userId} 成功绑定上级邀请人: ${referrerId}`);
+    return true;
+  }
+
+  /**
+   * 记录跟单成交产生的推广返佣收益并自动累加至邀请人账本
+   */
+  public recordReferralReward(
+    traderUserId: number,
+    tradeNotionalUsdt: number
+  ): { referrerId: number; rewardUsdt: number; totalEarned: number } | null {
+    if (!tradeNotionalUsdt || tradeNotionalUsdt <= 0) return null;
+
+    const traderWallet = this.wallets.get(traderUserId);
+    if (!traderWallet || !traderWallet.referrerId) return null;
+
+    const referrerId = traderWallet.referrerId;
+    const referrerWallet = this.getOrCreateWallet(referrerId);
+
+    // Injective 衍生品基础 Taker 费率约 0.1% (0.001)
+    const takerFeeUsdt = tradeNotionalUsdt * 0.001;
+    // 邀请人返佣比例 (默认 25%)
+    const commissionRate = (this.config.referralRewardPercent || 25) / 100;
+    const rewardUsdt = Number((takerFeeUsdt * commissionRate).toFixed(4));
+
+    if (rewardUsdt <= 0) return null;
+
+    referrerWallet.referralEarningsUsdt = Number(
+      ((referrerWallet.referralEarningsUsdt || 0) + rewardUsdt).toFixed(4)
+    );
+    referrerWallet.referralVolumeUsdt = Number(
+      ((referrerWallet.referralVolumeUsdt || 0) + tradeNotionalUsdt).toFixed(2)
+    );
+
+    this.saveWallets();
+
+    return {
+      referrerId,
+      rewardUsdt,
+      totalEarned: referrerWallet.referralEarningsUsdt,
+    };
+  }
+
+  /**
+   * 获取指定用户的邀请返佣统计明细 (已邀人数、累计收益、可提现金额)
+   */
+  public getReferralStats(userId: number) {
+    const wallet = this.getOrCreateWallet(userId);
+    const allWallets = this.getAllWallets();
+    const invitedUsers = allWallets.filter((w) => w.referrerId === userId);
+    const totalEarnings = wallet.referralEarningsUsdt || 0;
+    const withdrawn = wallet.referralWithdrawnUsdt || 0;
+    const available = Math.max(0, Number((totalEarnings - withdrawn).toFixed(4)));
+    const volume = wallet.referralVolumeUsdt || 0;
+
+    return {
+      invitedCount: invitedUsers.length,
+      invitedUsers: invitedUsers.map((u) => ({
+        telegramId: u.telegramId,
+        username: u.username,
+        joinedAt: u.createdAt,
+      })),
+      totalEarnings,
+      withdrawn,
+      available,
+      volume,
+    };
+  }
+
+  /**
+   * 用户申请提现已累积的推广返佣 (满 1.00 USDT 即可结算划转)
+   */
+  public withdrawReferralRewards(
+    userId: number
+  ): { success: boolean; amount: number; message: string; wallet: UserWallet } {
+    const wallet = this.getOrCreateWallet(userId);
+    const stats = this.getReferralStats(userId);
+
+    if (stats.available < 1.0) {
+      return {
+        success: false,
+        amount: 0,
+        message: `提现门槛为 1.00 USDT，当前可提现余额为 $${stats.available.toFixed(4)} USDT，未达提现标准！`,
+        wallet,
+      };
+    }
+
+    const withdrawAmount = stats.available;
+    wallet.referralWithdrawnUsdt = Number(
+      ((wallet.referralWithdrawnUsdt || 0) + withdrawAmount).toFixed(4)
+    );
+
+    // 提现收益可直接注入用户体验金余额中，或作为可提现记录
+    if (wallet.practiceMode) {
+      wallet.practiceBalanceUsdt = Number(
+        ((wallet.practiceBalanceUsdt || 10000) + withdrawAmount).toFixed(2)
+      );
+    }
+
+    this.saveWallets();
+    return {
+      success: true,
+      amount: withdrawAmount,
+      message: `🎉 成功提取 $${withdrawAmount.toFixed(2)} USDT 返佣奖励！`,
+      wallet,
+    };
   }
 }

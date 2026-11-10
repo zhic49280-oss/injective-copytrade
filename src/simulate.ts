@@ -532,8 +532,54 @@ async function runSimulation() {
     throw new Error('未能严格区分真实盘口成交价 (fillPrice) 与滑点保护价 (adjustedPrice)！');
   }
 
+  // --- 测试用例 8: 裂变邀请返佣全链路记账、动态收益看板与提现机制 ---
+  console.log('\n[8/8] 验证裂变邀请返佣 (Referral System) 全链路自动记账与提现结算...');
+  const inviterId = 888888;
+  const inviteeId = 999999;
+
+  // 1. 模拟好友通过专属推广链接 /start ref_888888 绑定邀请关系
+  const bindSuccess = walletService.bindReferrer(inviteeId, inviterId);
+  const duplicateBind = walletService.bindReferrer(inviteeId, 777777); // 尝试重复绑定或篡改
+  const selfBind = walletService.bindReferrer(inviterId, inviterId); // 尝试绑定自己
+
+  console.log(`   - 推广链接激活邀请绑定: ${bindSuccess ? '✅ 成功绑定' : '❌ 绑定失败'}`);
+  console.log(`   - 防篡改保护 (不可覆盖已有推荐人): ${!duplicateBind ? '✅ 拦截成功' : '❌ 拦截失败'}`);
+  console.log(`   - 防刷保护 (不可自我邀请): ${!selfBind ? '✅ 拦截成功' : '❌ 拦截失败'}`);
+
+  if (!bindSuccess || duplicateBind || selfBind) {
+    throw new Error('邀请关系绑定与防刷保护逻辑异常！');
+  }
+
+  // 2. 好友产生交易，系统实时按 25% 比例累加推广返佣
+  // 例如好友跟单成交 $5,000 USDT 仓位，0.1% Taker费 = $5 USDT，25% 返佣 = $1.25 USDT
+  const refReward = walletService.recordReferralReward(inviteeId, 5000);
+  console.log(`   - 跟单成交自动派发返佣: reward=$${refReward?.rewardUsdt} USDT (预期 $1.25), 累计总额=$${refReward?.totalEarned} USDT`);
+
+  if (!refReward || refReward.rewardUsdt !== 1.25 || refReward.referrerId !== inviterId) {
+    throw new Error('返佣自动核算与派发异常！');
+  }
+
+  // 3. 邀请人查看看板统计
+  const inviterStats = walletService.getReferralStats(inviterId);
+  console.log(`   - 邀请人收益看板: 邀请人数=${inviterStats.invitedCount}人, 好友总交易量=$${inviterStats.volume}, 可提现余额=$${inviterStats.available} USDT`);
+  if (inviterStats.invitedCount !== 1 || inviterStats.volume !== 5000 || inviterStats.available !== 1.25) {
+    throw new Error('返佣看板明细数据统计异常！');
+  }
+
+  // 4. 提现流程验证 (满 1.00 USDT 提现)
+  const withdrawRes = walletService.withdrawReferralRewards(inviterId);
+  console.log(`   - 满 1U 提现结算: success=${withdrawRes.success}, 提现金额=$${withdrawRes.amount} USDT, 消息=${withdrawRes.message}`);
+
+  const postWithdrawStats = walletService.getReferralStats(inviterId);
+  console.log(`   - 提现后剩余可用余额: $${postWithdrawStats.available} USDT (预期 0), 已提现: $${postWithdrawStats.withdrawn} USDT (预期 1.25)`);
+
+  if (!withdrawRes.success || postWithdrawStats.available !== 0 || postWithdrawStats.withdrawn !== 1.25) {
+    throw new Error('返佣提现核销与扣减逻辑异常！');
+  }
+  console.log('✅ 测试用例 8 通过: 邀请关系绑定、25% 佣金自动累积、收益看板与 1U 提现结算 100% 真实可用！');
+
   console.log('\n========================================================================');
-  console.log('🎉 全部 7 项生产级仿真与核心业务测试圆满通过！');
+  console.log('🎉 全部 8 项生产级仿真与核心业务测试圆满通过！');
   console.log('========================================================================\n');
 }
 

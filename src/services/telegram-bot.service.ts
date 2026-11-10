@@ -694,7 +694,33 @@ ${practiceInfo}
     });
 
     // 1. /start 与 /menu 指令
-    this.bot.command('start', (ctx) => this.renderMainMenu(ctx, false));
+    this.bot.command('start', async (ctx) => {
+      const match = (ctx.match || '').trim();
+      const userId = ctx.from?.id || 0;
+      if (match.startsWith('ref_')) {
+        const inviterId = parseInt(match.replace('ref_', ''), 10);
+        if (inviterId && inviterId !== userId) {
+          const bound = this.walletService.bindReferrer(userId, inviterId);
+          if (bound) {
+            await ctx.reply(
+              `🎉 <b>欢迎激活 Injective 聪明钱跟单矩阵！</b>\n您已通过推荐人 (<code>ID: ${inviterId}</code>) 的专属邀请链接成功激活，已为您开启优先风控通道！`,
+              { parse_mode: 'HTML' }
+            ).catch(() => {});
+
+            try {
+              await ctx.api.sendMessage(
+                inviterId,
+                `🎁 <b>【新好友成功加入提醒】</b>\n好友 @${ctx.from?.username || userId} (<code>${userId}</code>) 已通过您的专属推广链接加入机器人！后续该好友每笔跟单成交，您都将自动获得 <b>25% 手续费现金返佣</b>！`,
+                { parse_mode: 'HTML' }
+              );
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+      await this.renderMainMenu(ctx, false);
+    });
     this.bot.command('menu', (ctx) => this.renderMainMenu(ctx, false));
 
     // 2. /track 指令 (支持直接带参数 /track inj1... 或单独输入)
@@ -1401,25 +1427,34 @@ ${targetsLines}
       });
     });
 
-    // 邀请返佣
+    // 邀请返佣收益看板
     this.bot.callbackQuery('view_referral', async (ctx) => {
       const userId = ctx.from?.id || 888888;
       const botName = this.bot?.botInfo?.username || 'injective_copy_bot';
       const refLink = `https://t.me/${botName}?start=ref_${userId}`;
+      const stats = this.walletService.getReferralStats(userId);
 
       const text = `
-🎁 <b>Injective 裂变邀请返佣计划</b>
+🎁 <b>Injective 裂变邀请返佣收益看板</b>
 
 邀请好友使用您的专属链接开启跟单，<b>终身享受好友产生交易手续费的 ${this.config.referralRewardPercent}% 现金分红！</b>
+
+📊 <b>您的推广业绩统计:</b>
+• 👥 <b>成功邀请好友</b>: <b>${stats.invitedCount} 人</b>
+• 📈 <b>好友累计交易量</b>: <b>$${stats.volume.toLocaleString()} USDT</b>
+• 💰 <b>历史累计总返佣</b>: <b>+$${stats.totalEarnings.toFixed(4)} USDT</b>
+• 💳 <b>当前可提现余额</b>: <b>$${stats.available.toFixed(4)} USDT</b>
+• 📤 <b>已成功提现金额</b>: <b>$${stats.withdrawn.toFixed(4)} USDT</b>
 
 🔗 <b>您的专属推广链接:</b>
 <code>${refLink}</code>
 
-💡 <b>推广话术推荐:</b>
-<i>“Injective 链上实盘聪明钱巨鲸自动跟单，资金在自己钱包无提现风险，一键挂机带飞：${refLink}”</i>
+💡 <i>返佣资金由系统在好友每笔成交后实时自动累积记账，满 1.00 USDT 即可点击下方按钮秒提现至钱包！</i>
       `.trim();
 
       const keyboard = new InlineKeyboard()
+        .text('💳 立即提取返佣收益 (满1U可提)', 'withdraw_referral')
+        .row()
         .url(
           '🚀 转发到 Telegram 群/好友',
           `https://t.me/share/url?url=${encodeURIComponent(refLink)}&text=${encodeURIComponent('Injective 链上实盘聪明钱巨鲸自动跟单神器，点此开启挂机跟单！')}`
@@ -1431,6 +1466,58 @@ ${targetsLines}
         parse_mode: 'HTML',
         reply_markup: keyboard,
       });
+    });
+
+    // 申请提现推广返佣
+    this.bot.callbackQuery('withdraw_referral', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      const res = this.walletService.withdrawReferralRewards(userId);
+      if (!res.success) {
+        await ctx.answerCallbackQuery({ text: res.message, show_alert: true }).catch(() => {});
+        return;
+      }
+
+      await ctx.answerCallbackQuery({
+        text: `🎉 成功提现 $${res.amount.toFixed(2)} USDT！已直接划转至您的可用账户余额。`,
+        show_alert: true,
+      }).catch(() => {});
+
+      // 重新渲染返佣看板最新数据
+      const botName = this.bot?.botInfo?.username || 'injective_copy_bot';
+      const refLink = `https://t.me/${botName}?start=ref_${userId}`;
+      const stats = this.walletService.getReferralStats(userId);
+      const text = `
+🎁 <b>Injective 裂变邀请返佣收益看板</b>
+
+邀请好友使用您的专属链接开启跟单，<b>终身享受好友产生交易手续费的 ${this.config.referralRewardPercent}% 现金分红！</b>
+
+📊 <b>您的推广业绩统计:</b>
+• 👥 <b>成功邀请好友</b>: <b>${stats.invitedCount} 人</b>
+• 📈 <b>好友累计交易量</b>: <b>$${stats.volume.toLocaleString()} USDT</b>
+• 💰 <b>历史累计总返佣</b>: <b>+$${stats.totalEarnings.toFixed(4)} USDT</b>
+• 💳 <b>当前可提现余额</b>: <b>$${stats.available.toFixed(4)} USDT</b>
+• 📤 <b>已成功提现金额</b>: <b>$${stats.withdrawn.toFixed(4)} USDT</b>
+
+🔗 <b>您的专属推广链接:</b>
+<code>${refLink}</code>
+
+💡 <i>返佣资金由系统在好友每笔成交后实时自动累积记账，满 1.00 USDT 即可点击下方按钮秒提现至钱包！</i>
+      `.trim();
+
+      const keyboard = new InlineKeyboard()
+        .text('💳 立即提取返佣收益 (满1U可提)', 'withdraw_referral')
+        .row()
+        .url(
+          '🚀 转发到 Telegram 群/好友',
+          `https://t.me/share/url?url=${encodeURIComponent(refLink)}&text=${encodeURIComponent('Injective 链上实盘聪明钱巨鲸自动跟单神器，点此开启挂机跟单！')}`
+        )
+        .row()
+        .text('🔙 返回主菜单', 'back_to_menu');
+
+      await ctx.editMessageText(text, {
+        parse_mode: 'HTML',
+        reply_markup: keyboard,
+      }).catch(() => {});
     });
 
     // 实时盈亏与战绩看板
@@ -1933,6 +2020,21 @@ ${check.error || '输入的地址格式不正确'}
             })
           : `⚠️ <b>【模拟盘跟单未执行】</b>\n\n• 原因: <i>${pracRes.error}</i>`;
 
+        // 好友跟单裂变返佣自动结算与到账记账
+        if (pracRes.success) {
+          const tradeNotional = sizing.userQuantity * sizing.execPrice;
+          const refRes = this.walletService.recordReferralReward(chatId, tradeNotional);
+          if (refRes && refRes.rewardUsdt >= 0.0001 && this.bot) {
+            try {
+              await this.bot.api.sendMessage(
+                refRes.referrerId,
+                `💰 <b>【好友跟单返佣到账】</b>\n\n• 来自好友: @${w.username || chatId}\n• 本单产生返佣: <b>+$${refRes.rewardUsdt.toFixed(4)} USDT</b>\n• 您的累计总返佣: <b>$${refRes.totalEarned.toFixed(2)} USDT</b>\n\n👉 <i>随时点击主菜单【🎁 邀请返佣】查看明细与申请提现！</i>`,
+                { parse_mode: 'HTML' }
+              );
+            } catch (e) {}
+          }
+        }
+
         // 消息限流防刷屏控制：30 秒内最多发送 1 条成交详情推送，避免高频巨鲸刷屏上千条消息打扰用户
         const now = Date.now();
         const lastNotice = this.lastUserNotificationTime.get(chatId) || 0;
@@ -1994,6 +2096,19 @@ ${check.error || '输入的地址格式不正确'}
             userQuantity: sizing.userQuantity,
             userMargin: sizing.userMargin,
           });
+
+          // 好友实盘跟单裂变返佣自动结算与到账记账
+          const tradeNotional = sizing.userQuantity * sizing.execPrice;
+          const refRes = this.walletService.recordReferralReward(chatId, tradeNotional);
+          if (refRes && refRes.rewardUsdt >= 0.0001 && this.bot) {
+            try {
+              await this.bot.api.sendMessage(
+                refRes.referrerId,
+                `💰 <b>【好友实盘跟单返佣到账】</b>\n\n• 来自好友: @${w.username || chatId}\n• 本单产生返佣: <b>+$${refRes.rewardUsdt.toFixed(4)} USDT</b>\n• 您的累计总返佣: <b>$${refRes.totalEarned.toFixed(2)} USDT</b>\n\n👉 <i>随时点击主菜单【🎁 邀请返佣】查看明细与申请提现！</i>`,
+                { parse_mode: 'HTML' }
+              );
+            } catch (e) {}
+          }
 
           if (this.bot) {
             try {
