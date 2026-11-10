@@ -1611,6 +1611,39 @@ ${targetLines}
    */
   private async applyFollowTarget(ctx: any, targetAddress: string, isCallback: boolean = false) {
     const userId = ctx.from?.id || 0;
+
+    // 做市商与高频刷量机器人防御拦截：绝对禁止用户选到做市商跟单
+    const mmAudit = await this.leaderboard.auditTraderIsMarketMaker(targetAddress);
+    if (mmAudit.isMarketMaker) {
+      const alertText = `
+🛡️ <b>【系统风控安全拦截：检测到高频做市商】</b>
+
+• <b>目标地址</b>: <code>${targetAddress}</code>
+• <b>识别诊断</b>: <b>${mmAudit.reason || '高频做市商 / 网格对冲套利程序'}</b>
+
+⚠️ <b>为什么系统严禁跟单此类地址？</b>
+1. 该地址属于<b>链上高频做市商/套利程序</b>，依靠频繁挂单（Maker）赚取极微小价差或交易所返佣。
+2. 跟单系统使用市价吃单（Taker），跟随此类程序将承受<b>每笔 0.1% 的滑点与手续费双重磨损</b>，导致本金在频繁对冲中迅速缩水！
+
+⛔ <b>系统已自动拦截该跟单请求，保障您的本金安全！</b>
+👉 建议前往<b>【🏆 聪明钱排行榜】</b>选择持仓周期长、单笔规模大的真实波段巨鲸。
+      `.trim();
+
+      const keyboard = new InlineKeyboard()
+        .text('🏆 选择精选波段巨鲸', 'view_leaderboard')
+        .text('🔙 返回主菜单', 'back_to_menu');
+
+      if (isCallback) {
+        await ctx.answerCallbackQuery({ text: '⚠️ 拦截：该地址为做市商程序，已拒绝跟单！', show_alert: true }).catch(() => {});
+        await ctx.editMessageText(alertText, { parse_mode: 'HTML', reply_markup: keyboard }).catch(async () => {
+          await ctx.reply(alertText, { parse_mode: 'HTML', reply_markup: keyboard });
+        });
+      } else {
+        await ctx.reply(alertText, { parse_mode: 'HTML', reply_markup: keyboard });
+      }
+      return;
+    }
+
     const userWallet = this.walletService.getOrCreateWallet(userId, ctx.from?.username);
     const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
     const isPractice = this.walletService.isPracticeMode(userId);

@@ -3,6 +3,7 @@ import { getSubaccountId, getInjectiveAddressFromSubaccountId } from '@injective
 import { AppConfig } from '../config/index.js';
 import { InjectiveService } from './injective.service.js';
 import { SmartMoneyTradeEvent, TradeDirection } from '../types/index.js';
+import { KNOWN_MARKET_MAKERS } from './leaderboard.service.js';
 
 export class SmartMoneyTracker extends EventEmitter {
   private config: AppConfig;
@@ -276,6 +277,11 @@ export class SmartMoneyTracker extends EventEmitter {
 
     this.processedTradeIds.add(tradeId);
 
+    // 0. 做市商黑名单防御：若来自已知做市商/套利机器人地址，直接丢弃信号
+    if (fallbackTraderAddress && KNOWN_MARKET_MAKERS.has(fallbackTraderAddress.toLowerCase())) {
+      return;
+    }
+
     // 1. 过滤被动挂单 (Maker) 成交，仅跟随主动吃单 (Taker) 趋势信号
     const execSide = (rawTrade.executionSide || '').toLowerCase();
     if (execSide && execSide !== 'taker') {
@@ -298,8 +304,8 @@ export class SmartMoneyTracker extends EventEmitter {
     const quantity = parseFloat(rawTrade.executionQuantity || rawTrade.quantity || '0');
     const notionalUsd = price * quantity;
 
-    // 2. 严格过滤碎单与微额自动化调仓：单笔名义金额低于 $30 USD 的视为噪声直接跳过 (杜绝跟随 $1.42 等碎单)
-    if (notionalUsd < 30) {
+    // 2. 严格过滤碎单与微额自动化调仓：单笔名义金额低于 $50 USD 的视为噪声直接跳过 (杜绝跟随 $1.42 等微型碎单磨损)
+    if (notionalUsd < 50) {
       return;
     }
 

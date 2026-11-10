@@ -2,6 +2,7 @@ import { Bot, InlineKeyboard } from 'grammy';
 import { IndexerGrpcDerivativesApi, getInjectiveAddressFromSubaccountId } from '@injectivelabs/sdk-ts';
 import { getNetworkEndpoints, Network } from '@injectivelabs/networks';
 import { AppConfig } from '../config/index.js';
+import { KNOWN_MARKET_MAKERS } from './leaderboard.service.js';
 
 export interface WhaleAlert {
   id: string;
@@ -158,6 +159,8 @@ export class WhaleRadarService {
         } catch {
           continue;
         }
+
+        if (KNOWN_MARKET_MAKERS.has(traderAddress.toLowerCase())) continue;
 
         const isBuy = (trade.tradeDirection || '').toLowerCase().includes('buy');
         const ticker = this.marketIdToTicker.get(trade.marketId) || 'INJ/USDC PERP';

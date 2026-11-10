@@ -1,9 +1,110 @@
 import {
   IndexerGrpcDerivativesApi,
   getInjectiveAddressFromSubaccountId,
+  getDefaultSubaccountId,
   Address,
 } from '@injectivelabs/sdk-ts';
 import { Network, getNetworkEndpoints } from '@injectivelabs/networks';
+
+/**
+ * 链上已知高频做市商/套利程序/网格算法黑名单 (杜绝进入排行榜或被用户跟单)
+ */
+export const KNOWN_MARKET_MAKERS = new Set<string>([
+  'inj1exyaj8xflhqvrs5x30lxms4egya4v527tzu2xq', // 0xu2xq - ETH 高频双向吃单/网格对冲做市程序
+  'inj1ntzp6egl4z6e7gfmvsc63mh8ee5h4m2xqhn3lk', // 0xn3lk - 92% Maker 挂单/微量碎单刷量做市商
+]);
+
+/**
+ * 深度智能评估一个链上地址是否为做市商或高频套利机器人
+ */
+export function isMarketMakerOrHftBot(params: {
+  address: string;
+  trades: any[];
+  totalNotionalUsd?: number;
+  openPosCount?: number;
+}): { isMarketMaker: boolean; reason?: string } {
+  const addrLower = params.address.toLowerCase();
+  if (KNOWN_MARKET_MAKERS.has(addrLower)) {
+    return {
+      isMarketMaker: true,
+      reason: '已列入链上高频做市商/对冲套利程序黑名单 (依靠频繁双向对倒与挂单返佣盈利，跟单将承受高额Taker手续费与滑点磨损)',
+    };
+  }
+
+  const trades = params.trades || [];
+  if (trades.length < 5) {
+    return { isMarketMaker: false };
+  }
+
+  const now = Date.now();
+  let makerCount = 0;
+  let totalNotional = 0;
+  let recent1hTrades = 0;
+  const marketTradeCounts = new Map<string, number>();
+  let sameMarketRapidFlips = 0;
+
+  for (let i = 0; i < trades.length; i++) {
+    const t = trades[i];
+    const isMaker = (t.executionSide || '').toLowerCase() === 'maker';
+    if (isMaker) makerCount += 1;
+
+    const p = parseFloat(t.executionPrice || '0') / 1e6;
+    const q = parseFloat(t.executionQuantity || '0');
+    totalNotional += p * q;
+
+    const rawTs = Number(t.executedAt || 0);
+    const ts = rawTs > 0 && rawTs < 1e12 ? rawTs * 1000 : rawTs;
+    if (now - ts <= 3600_000) {
+      recent1hTrades += 1;
+    }
+
+    const mid = t.marketId || 'unknown';
+    marketTradeCounts.set(mid, (marketTradeCounts.get(mid) || 0) + 1);
+
+    // 检测同一标的 5 分钟内快速反手 (买卖反向)
+    if (i < trades.length - 1) {
+      const nextT = trades[i + 1];
+      if (t.marketId === nextT.marketId && t.tradeDirection !== nextT.tradeDirection) {
+        const nextTs = Number(nextT.executedAt || 0);
+        const actualNextTs = nextTs > 0 && nextTs < 1e12 ? nextTs * 1000 : nextTs;
+        if (Math.abs(ts - actualNextTs) <= 300_000) {
+          sameMarketRapidFlips += 1;
+        }
+      }
+    }
+  }
+
+  const makerRatio = makerCount / trades.length;
+  const avgNotional = totalNotional / trades.length;
+  const maxTradesOnOneMarket = Math.max(...Array.from(marketTradeCounts.values()));
+  const singleMarketConcentration = maxTradesOnOneMarket / trades.length;
+
+  // 1. 同标的频繁双向反手吃单 (典型高频做市/对冲套利特征)
+  if (sameMarketRapidFlips >= 2) {
+    return {
+      isMarketMaker: true,
+      reason: `同一标的5分钟内频繁反向开平仓 (${sameMarketRapidFlips}次)，属于高频网格对冲算法`,
+    };
+  }
+
+  // 2. 极端高频且单标的高集中度 (如 1 小时内单标的成交超过 15 笔)
+  if (recent1hTrades >= 15 && singleMarketConcentration >= 0.7) {
+    return {
+      isMarketMaker: true,
+      reason: `近1小时集中在单标的交易 ${recent1hTrades} 笔，属于高频套利吃单机器人`,
+    };
+  }
+
+  // 3. 高 Maker 挂单比率 + 微额单 (极低单笔金额 + 绝大多数 Maker 挂单，属于流动性提供者)
+  if (trades.length >= 10 && makerRatio >= 0.65 && avgNotional < 100) {
+    return {
+      isMarketMaker: true,
+      reason: `被动挂单 (Maker) 占比达 ${(makerRatio * 100).toFixed(0)}% 且单笔均额极小 ($${avgNotional.toFixed(1)})，属于做市商`,
+    };
+  }
+
+  return { isMarketMaker: false };
+}
 
 /**
  * Injective 链上真实巨鲸实盘持仓与战绩榜数据结构 (100% 链上真实持仓与成交聚合，零虚构)
@@ -246,8 +347,13 @@ export class LeaderboardService {
             ? Math.max(0, Math.round((now - lastTradeTimestamp) / 60000))
             : 999999;
 
-        // 识别极端高频对敲/洗量机器人: 近 1 小时成交 > 60 笔 (每分钟都开平仓)
-        const isHftOrMakerBot = recent1hTrades > 60;
+        const mmEval = isMarketMakerOrHftBot({
+          address: cand.address,
+          trades,
+          totalNotionalUsd: cand.totalNotionalUsd,
+          openPosCount: cand.openPosCount,
+        });
+        const isHftOrMakerBot = mmEval.isMarketMaker;
 
         evaluatedCandidates.push({
           cand,
@@ -258,9 +364,9 @@ export class LeaderboardService {
         });
       }
 
-      // 优先筛选非极高频刷量机器人的真实巨鲸；若不足 5 名则使用全部候选池
+      // 严格剔除所有做市商与高频刷量机器人，绝对禁止做市商混入榜单供用户跟单
       const directionalCandidates = evaluatedCandidates.filter((item) => !item.isHftOrMakerBot);
-      const pool = directionalCandidates.length >= 5 ? directionalCandidates : evaluatedCandidates;
+      const pool = directionalCandidates;
 
       // 严格剔除 7 天以上的僵尸死仓：优先筛选 24 小时内 (lastTradeMinutesAgo <= 1440) 的活跃盈利巨鲸
       const active24h = pool
@@ -411,5 +517,36 @@ export class LeaderboardService {
 
     this.whales.push(profile);
     return profile;
+  }
+
+  /**
+   * 针对任意指定地址进行实时做市商/高频套利特征审计
+   */
+  public async auditTraderIsMarketMaker(
+    address: string
+  ): Promise<{ isMarketMaker: boolean; reason?: string }> {
+    const cleanAddr = address.trim().toLowerCase();
+    if (KNOWN_MARKET_MAKERS.has(cleanAddr)) {
+      return {
+        isMarketMaker: true,
+        reason: '已列入链上已知高频做市商/套利程序黑名单 (依靠频繁双向对倒与挂单返佣盈利)',
+      };
+    }
+
+    try {
+      const subaccountId = getDefaultSubaccountId(address);
+      const res = await this.mainnetApi.fetchTrades({
+        subaccountId,
+        pagination: { limit: 50 },
+      });
+      const trades = res.trades || [];
+      return isMarketMakerOrHftBot({
+        address,
+        trades,
+      });
+    } catch {
+      // 若网络偶发异常且未在黑名单中，由下游兜底
+      return { isMarketMaker: false };
+    }
   }
 }

@@ -3,6 +3,7 @@ import path from 'path';
 import { PrivateKey, getSubaccountId, IndexerGrpcAccountPortfolioApi } from '@injectivelabs/sdk-ts';
 import BigNumber from 'bignumber.js';
 import { AppConfig } from '../config/index.js';
+import { KNOWN_MARKET_MAKERS } from './leaderboard.service.js';
 
 export interface PracticePosition {
   marketId?: string;
@@ -78,7 +79,8 @@ export class WalletService {
     const isDirtyAddr = (addr?: string) =>
       !addr ||
       addr === 'inj10k7vw7thyltfjag0junlxfrd0nf4wjjc3grecn' ||
-      addr === item.injectiveAddress;
+      addr === item.injectiveAddress ||
+      KNOWN_MARKET_MAKERS.has(addr.toLowerCase());
 
     if (!Array.isArray(item.followedTargets)) {
       item.followedTargets = [];
