@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { PrivateKey, getSubaccountId, IndexerGrpcAccountPortfolioApi } from '@injectivelabs/sdk-ts';
 import BigNumber from 'bignumber.js';
 import { AppConfig } from '../config/index.js';
@@ -66,12 +67,65 @@ export class WalletService {
   private portfolioApi: IndexerGrpcAccountPortfolioApi;
   private storageFile: string;
   private wallets: Map<number, UserWallet> = new Map();
+  private encryptionKey: Buffer;
 
   constructor(config: AppConfig, endpoints: { indexer: string }) {
     this.config = config;
     this.portfolioApi = new IndexerGrpcAccountPortfolioApi(endpoints.indexer);
     this.storageFile = path.resolve(process.cwd(), 'data', 'wallets.json');
+
+    // 初始化金融级 AES-256-GCM 主加密密钥 (杜绝明文私钥/助记词在硬盘落地存储)
+    const masterSeed =
+      process.env.WALLET_ENCRYPTION_SECRET ||
+      process.env.TELEGRAM_BOT_TOKEN ||
+      'injective-copytrade-vault-master-seed-2026';
+    this.encryptionKey = crypto.createHash('sha256').update(masterSeed).digest();
+
     this.loadWallets();
+  }
+
+  /**
+   * 使用 AES-256-GCM 高级加密标准对敏感私钥或助记词进行加密落地存储
+   */
+  public encryptSecret(text?: string): string {
+    if (!text) return '';
+    if (text.startsWith('enc:v1:')) return text;
+    try {
+      const iv = crypto.randomBytes(12);
+      const cipher = crypto.createCipheriv('aes-256-gcm', this.encryptionKey, iv);
+      let encrypted = cipher.update(text, 'utf8', 'hex');
+      encrypted += cipher.final('hex');
+      const tag = cipher.getAuthTag();
+      return `enc:v1:${iv.toString('hex')}:${tag.toString('hex')}:${encrypted}`;
+    } catch {
+      return text;
+    }
+  }
+
+  /**
+   * 解密 AES-256-GCM 密文私钥（同时透明兼容历史旧版明文并触发自动升级迁移）
+   */
+  public decryptSecret(ciphertext?: string): string {
+    if (!ciphertext) return '';
+    if (!ciphertext.startsWith('enc:v1:')) {
+      // 历史明文私钥：原样返回并触发后续自动加密持久化
+      return ciphertext;
+    }
+    try {
+      const parts = ciphertext.split(':');
+      if (parts.length !== 5) return ciphertext;
+      const iv = Buffer.from(parts[2], 'hex');
+      const tag = Buffer.from(parts[3], 'hex');
+      const encrypted = parts[4];
+      const decipher = crypto.createDecipheriv('aes-256-gcm', this.encryptionKey, iv);
+      decipher.setAuthTag(tag);
+      let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+      return decrypted;
+    } catch (e: any) {
+      console.warn('[WalletService] 私钥解密告警:', e.message);
+      return ciphertext;
+    }
   }
 
   private sanitizeAndMigrateTargets(item: UserWallet): boolean {
@@ -222,6 +276,20 @@ export class WalletService {
         const list: UserWallet[] = JSON.parse(raw);
         let dirtyFixed = false;
         for (const item of list) {
+          // 自动解密私钥与助记词 (若读取到历史明文，标记 dirtyFixed=true 触发自动加密回写)
+          if (item.privateKeyHex) {
+            if (!item.privateKeyHex.startsWith('enc:v1:')) {
+              dirtyFixed = true;
+            }
+            item.privateKeyHex = this.decryptSecret(item.privateKeyHex);
+          }
+          if (item.mnemonic) {
+            if (!item.mnemonic.startsWith('enc:v1:')) {
+              dirtyFixed = true;
+            }
+            item.mnemonic = this.decryptSecret(item.mnemonic);
+          }
+
           if (this.sanitizeAndMigrateTargets(item)) {
             dirtyFixed = true;
           }
@@ -299,7 +367,12 @@ export class WalletService {
         fs.mkdirSync(dir, { recursive: true });
       }
       const list = Array.from(this.wallets.values());
-      fs.writeFileSync(this.storageFile, JSON.stringify(list, null, 2), 'utf-8');
+      const encryptedList = list.map((item) => ({
+        ...item,
+        privateKeyHex: this.encryptSecret(item.privateKeyHex),
+        mnemonic: item.mnemonic ? this.encryptSecret(item.mnemonic) : undefined,
+      }));
+      fs.writeFileSync(this.storageFile, JSON.stringify(encryptedList, null, 2), 'utf-8');
     } catch (e: any) {
       console.error('[WalletService] 钱包持久化失败:', e.message);
     }

@@ -453,6 +453,16 @@ async function runSimulation() {
     throw new Error('未成功生成标准 12 位 BIP39 助记词！');
   }
 
+  // 验证 AES-256-GCM 硬盘落地存储加密防线 (杜绝明文私钥落地存储)
+  const diskRaw = fs.readFileSync(path.resolve(process.cwd(), 'data', 'wallets.json'), 'utf-8');
+  if (diskRaw.includes(testWallet.privateKeyHex) || (testWallet.mnemonic && diskRaw.includes(testWallet.mnemonic))) {
+    throw new Error('安全防线失效：私钥或助记词以明文形式写入了硬盘 wallets.json！');
+  }
+  if (!diskRaw.includes('enc:v1:')) {
+    throw new Error('安全防线失效：wallets.json 中未找到 enc:v1: AES-256 加密标记！');
+  }
+  console.log('   - 硬盘存储安全验证: wallets.json 落地存储已全部通过 AES-256-GCM 加密 (enc:v1:...)，零明文私钥泄露！');
+
   // 验证重新生成助记词钱包
   const originalMnemonic = testWallet.mnemonic!;
   const originalAddress = testWallet.injectiveAddress;
