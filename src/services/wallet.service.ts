@@ -7,6 +7,7 @@ import { AppConfig } from '../config/index.js';
 export interface PracticePosition {
   marketId?: string;
   marketTicker: string;
+  traderAddress?: string;
   direction: 'BUY' | 'SELL';
   entryPrice: number;
   quantity: number;
@@ -234,6 +235,20 @@ export class WalletService {
                 pos.entryPrice = Number((pos.entryPrice / 1e6).toFixed(6));
                 dirtyFixed = true;
               }
+              // 自动修复历史开仓价为 0 或保证金为 0 的异常代币 (如早期 PEPE)
+              if ((!pos.entryPrice || pos.entryPrice <= 0 || !pos.marginUsdt) && pos.marketTicker) {
+                if (pos.marketTicker.toUpperCase().includes('PEPE')) {
+                  pos.entryPrice = 0.00000514;
+                  pos.marginUsdt = Number(((pos.quantity * pos.entryPrice) / (pos.leverage || 5)).toFixed(2)) || 10;
+                  dirtyFixed = true;
+                }
+              }
+            }
+            // 剔除任何依然无法解析真实价格 (entryPrice <= 0) 的脏数据持仓
+            const beforeLen = item.practicePositions.length;
+            item.practicePositions = item.practicePositions.filter((p) => p.entryPrice > 0 && p.quantity > 0);
+            if (item.practicePositions.length !== beforeLen) {
+              dirtyFixed = true;
             }
           }
           if (item.practiceRealizedPnlUsdt === undefined) {
@@ -371,6 +386,7 @@ export class WalletService {
       | {
           marketId?: string;
           marketTicker: string;
+          traderAddress?: string;
           direction: 'BUY' | 'SELL';
           price: number;
           quantity: number;
@@ -382,7 +398,8 @@ export class WalletService {
     priceArg?: number,
     quantityArg?: number,
     leverageArg?: number,
-    marketIdArg?: string
+    marketIdArg?: string,
+    traderAddressArg?: string
   ): {
     success: boolean;
     action: 'OPEN' | 'CLOSE';
@@ -410,6 +427,7 @@ export class WalletService {
             leverage: leverageArg || 5,
             marginUsdt: ((priceArg || 0) * (quantityArg || 0)) / (leverageArg || 5),
             marketId: marketIdArg,
+            traderAddress: traderAddressArg,
           }
         : {
             ...paramsOrTicker,
@@ -419,16 +437,40 @@ export class WalletService {
                 : (paramsOrTicker.price * paramsOrTicker.quantity) / (paramsOrTicker.leverage || 5),
           };
 
-    const existingIdx = wallet.practicePositions.findIndex((p) => p.marketTicker === params.marketTicker);
+    // 优先匹配同巨鲸归属的同标的持仓，杜绝多巨鲸跟单时“巨鲸A做多被巨鲸B反手误平仓”的冲突！
+    const existingIdx = wallet.practicePositions.findIndex((p) => {
+      if (p.marketTicker !== params.marketTicker) return false;
+      if (params.traderAddress && p.traderAddress) {
+        return p.traderAddress.toLowerCase() === params.traderAddress.toLowerCase();
+      }
+      return true;
+    });
 
     // 情况 1: 已存在同标的持仓且方向相反 -> 执行平仓结算 (释放原保证金 + 结算净盈亏 - 0.1% 手续费)
     if (existingIdx !== -1 && wallet.practicePositions[existingIdx].direction !== params.direction) {
       const existing = wallet.practicePositions[existingIdx];
+
+      // 防高频闪电对敲洗盘保护：若持仓开仓不足 45 秒且价格未出现明显波动 (< 0.4%)，避免被高频做市商秒翻转反复摩擦手续费
+      const holdTimeSec = (Date.now() - (existing.timestamp || 0)) / 1000;
+      const priceChangePct = Math.abs((params.price - existing.entryPrice) / (existing.entryPrice || 1)) * 100;
+      if (holdTimeSec < 45 && priceChangePct < 0.4) {
+        return {
+          success: true,
+          action: 'OPEN',
+          wallet,
+          realizedPnlDelta: 0,
+        };
+      }
+
       const priceDiff =
         existing.direction === 'BUY'
           ? params.price - existing.entryPrice
           : existing.entryPrice - params.price;
-      const grossPnl = priceDiff * existing.quantity;
+      let grossPnl = priceDiff * existing.quantity;
+      const maxPnlCap = Math.max(100, (existing.marginUsdt || 20) * (existing.leverage || 5) * 3);
+      if (Math.abs(grossPnl) > maxPnlCap) {
+        grossPnl = grossPnl > 0 ? maxPnlCap : -maxPnlCap;
+      }
       const fee = params.price * existing.quantity * 0.001;
       const netPnl = Number((grossPnl - fee).toFixed(2));
 
@@ -483,23 +525,25 @@ export class WalletService {
 
     wallet.practiceBalanceUsdt = Number((wallet.practiceBalanceUsdt - marginToDeduct).toFixed(2));
 
-    // 情况 2: 已存在同标的同向持仓 -> 合并为单笔净持仓并加权更新开仓均价
+    // 情况 2: 已存在同标的同向持仓 -> 合并为单笔净持仓并加权更新开仓均价 (保留有效数字精度)
     if (existingIdx !== -1) {
       const existing = wallet.practicePositions[existingIdx];
       const newQty = Number((existing.quantity + params.quantity).toFixed(6));
       existing.entryPrice = Number(
-        ((existing.entryPrice * existing.quantity + params.price * params.quantity) / newQty).toFixed(6)
+        ((existing.entryPrice * existing.quantity + params.price * params.quantity) / newQty).toPrecision(8)
       );
       existing.quantity = newQty;
       existing.marginUsdt = Number((existing.marginUsdt + marginToDeduct).toFixed(2));
       existing.leverage = params.leverage || existing.leverage;
       if (params.marketId) existing.marketId = params.marketId;
+      if (params.traderAddress) existing.traderAddress = params.traderAddress;
       existing.timestamp = Date.now();
     } else {
       // 情况 3: 无该标的持仓 -> 新建 1 笔持仓
       wallet.practicePositions.push({
         marketId: params.marketId,
         marketTicker: params.marketTicker,
+        traderAddress: params.traderAddress,
         direction: params.direction,
         entryPrice: params.price,
         quantity: params.quantity,

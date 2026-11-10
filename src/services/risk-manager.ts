@@ -102,12 +102,21 @@ export class RiskManager {
       .dividedBy(safeLeverage)
       .toNumber();
 
+    // 动态智能保留精度：高价代币 (BTC/ETH) 保留 2-4 位，小市值微额代币 (如 PEPE 0.000005) 保留有效精度，杜绝 .toFixed(4) 将价格截断为 0！
+    const cleanPrice = (p: number) => {
+      if (!p || isNaN(p)) return 0;
+      if (p >= 100) return Number(p.toFixed(2));
+      if (p >= 1) return Number(p.toFixed(4));
+      if (p >= 0.001) return Number(p.toFixed(6));
+      return Number(p.toPrecision(7));
+    };
+
     return {
       passed: true,
       adjustedQuantity: Number(adjustedQuantity.toFixed(6)),
-      adjustedPrice: Number(worstCaseProtectionPrice.toFixed(4)),
-      fillPrice: Number(rawFillPrice.toFixed(4)),
-      calculatedMargin: Number(calculatedMargin.toFixed(4)),
+      adjustedPrice: cleanPrice(worstCaseProtectionPrice),
+      fillPrice: cleanPrice(rawFillPrice),
+      calculatedMargin: Number(calculatedMargin.toFixed(2)),
       leverage: safeLeverage,
     };
   }

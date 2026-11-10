@@ -33,6 +33,14 @@ export function validateInjectiveAddress(addr: string): { valid: boolean; error?
   }
 }
 
+export function formatDisplayPrice(price: number): string {
+  if (!price || isNaN(price)) return '0';
+  if (price >= 100) return price.toFixed(2);
+  if (price >= 1) return price.toFixed(4);
+  if (price >= 0.001) return price.toFixed(6);
+  return Number(price.toPrecision(6)).toString();
+}
+
 export class TelegramBotService {
   private config: AppConfig;
   private copyEngine: CopyEngine;
@@ -45,6 +53,7 @@ export class TelegramBotService {
   private activeUserChatIds: Set<number> = new Set();
   private awaitingAddressUsers: Set<number> = new Set();
   private awaitingWalletImportUsers: Set<number> = new Set();
+  private lastUserNotificationTime: Map<number, number> = new Map();
 
   constructor(
     config: AppConfig,
@@ -346,12 +355,13 @@ ${balanceDisplay}
 
       const notionalUsd = (curPrice * pos.quantity).toFixed(2);
       const cleanTicker = pos.marketTicker.replace('/USDC PERP', '').replace('/USDT PERP', '');
+      const whaleTag = pos.traderAddress ? ` | 巨鲸 0x${pos.traderAddress.slice(-4)}` : '';
 
       positionCards.push(
-        `┌── ${dirEmoji} <b>${cleanTicker}</b> (<code>${pos.leverage}x ${dirText}</code>)\n` +
+        `┌── ${dirEmoji} <b>${cleanTicker}</b> (<code>${pos.leverage}x ${dirText}${whaleTag}</code>)\n` +
           `│ 浮动盈亏: ${pnlEmoji} <b>${sign}$${uPnl.toFixed(2)} USDT (${sign}${uRoi}%)</b>\n` +
           `│ 仓位价值: <b>$${notionalUsd}</b> | 保证金: <b>$${pos.marginUsdt.toFixed(2)} USDT</b>\n` +
-          `│ 开仓均价: <code>$${pos.entryPrice}</code> ➔ 现价: <code>$${curPrice}</code>\n` +
+          `│ 开仓均价: <code>$${formatDisplayPrice(pos.entryPrice)}</code> ➔ 现价: <code>$${formatDisplayPrice(curPrice)}</code>\n` +
           `└──────────────────────────`
       );
     }
@@ -377,7 +387,7 @@ ${balanceDisplay}
       const hEmoji = h.netPnlUsdt >= 0 ? '🟢' : '🔴';
       const hDir = h.direction === 'BUY' ? '多' : '空';
       const cleanH = h.marketTicker.replace('/USDC PERP', '').replace('/USDT PERP', '');
-      return `  • ${hEmoji} <b>${cleanH} (${hDir})</b>: 开 $${h.entryPrice} ➔ 平 $${h.exitPrice} | 盈亏: <b>${hSign}$${h.netPnlUsdt.toFixed(2)} USDT</b>`;
+      return `  • ${hEmoji} <b>${cleanH} (${hDir})</b>: 开 $${formatDisplayPrice(h.entryPrice)} ➔ 平 $${formatDisplayPrice(h.exitPrice)} | 盈亏: <b>${hSign}$${h.netPnlUsdt.toFixed(2)} USDT</b>`;
     });
 
     const execModeDesc = isPractice
@@ -1730,15 +1740,7 @@ ${check.error || '输入的地址格式不正确'}
 ⚡ <i>云端多巨鲸跟单引擎已就绪，正在按您的专属仓位执行风控核算...</i>
     `.trim();
 
-    const matchedFollowers = this.getMatchedFollowerWallets(event.traderAddress);
-    for (const w of matchedFollowers) {
-      if (this.bot && w.telegramId) {
-        try {
-          await this.bot.api.sendMessage(w.telegramId, text, { parse_mode: 'HTML' });
-        } catch (e) {}
-      }
-    }
-
+    // 仅向公开广播频道推送开仓异动，避免向个人重复轰炸“开仓前预告 + 开仓后成交”两遍导致 1.2K 消息刷屏
     if (this.bot && this.config.telegramBroadcastChatId) {
       try {
         await this.bot.api.sendMessage(this.config.telegramBroadcastChatId, text, {
@@ -1888,6 +1890,7 @@ ${check.error || '输入的地址格式不正确'}
           quantity: sizing.userQuantity,
           marginUsdt: sizing.userMargin,
           leverage: sizing.leverage,
+          traderAddress: event?.traderAddress,
         });
 
         const text = pracRes.success
@@ -1897,13 +1900,19 @@ ${check.error || '输入的地址格式不正确'}
             })
           : `⚠️ <b>【模拟盘跟单未执行】</b>\n\n• 原因: <i>${pracRes.error}</i>`;
 
-        if (this.bot) {
-          try {
-            await this.bot.api.sendMessage(chatId, text, {
-              parse_mode: 'HTML',
-              link_preview_options: { is_disabled: true },
-            });
-          } catch (e) {}
+        // 消息限流防刷屏控制：30 秒内最多发送 1 条成交详情推送，避免高频巨鲸刷屏上千条消息打扰用户
+        const now = Date.now();
+        const lastNotice = this.lastUserNotificationTime.get(chatId) || 0;
+        if (now - lastNotice >= 30_000) {
+          this.lastUserNotificationTime.set(chatId, now);
+          if (this.bot) {
+            try {
+              await this.bot.api.sendMessage(chatId, text, {
+                parse_mode: 'HTML',
+                link_preview_options: { is_disabled: true },
+              });
+            } catch (e) {}
+          }
         }
       } else {
         // 2. 实盘链上交易模式：严禁谎报成功！必须先校验用户实盘 USDT 保证金与 INJ Gas 余额
