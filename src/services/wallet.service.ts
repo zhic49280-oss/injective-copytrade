@@ -5,6 +5,7 @@ import { PrivateKey, getSubaccountId, IndexerGrpcAccountPortfolioApi } from '@in
 import BigNumber from 'bignumber.js';
 import { AppConfig } from '../config/index.js';
 import { CopyMode } from '../types/index.js';
+import { BotLang, detectTelegramLang } from '../i18n.js';
 import { KNOWN_MARKET_MAKERS } from './leaderboard.service.js';
 
 export interface PracticePosition {
@@ -54,6 +55,7 @@ export interface ReferralPayoutRecord {
 export interface UserWallet {
   telegramId: number;
   username?: string;
+  language?: BotLang;
   injectiveAddress: string;
   evmAddress?: string;
   subaccountId: string;
@@ -508,7 +510,7 @@ export class WalletService {
   /**
    * 获取或自动为用户创建专属 Injective 真实链上钱包 (保存 12 位 BIP39 助记词与私钥)
    */
-  public getOrCreateWallet(telegramId: number, username?: string): UserWallet {
+  public getOrCreateWallet(telegramId: number, username?: string, telegramLanguageCode?: string): UserWallet {
     let wallet = this.wallets.get(telegramId);
     if (!wallet) {
       // 链上生成标准 BIP39 12位助记词、真实私钥与地址
@@ -521,6 +523,7 @@ export class WalletService {
       wallet = {
         telegramId,
         username,
+        language: telegramLanguageCode ? detectTelegramLang(telegramLanguageCode) : undefined,
         injectiveAddress,
         evmAddress,
         subaccountId,
@@ -540,14 +543,45 @@ export class WalletService {
       this.saveWallets();
       console.log(`[WalletService] 🆕 为用户 @${username || telegramId} 生成真实 Injective 钱包: ${injectiveAddress}`);
     } else {
+      let dirty = false;
       if (wallet.practiceBalanceUsdt === undefined) wallet.practiceBalanceUsdt = 10000;
       if (!Array.isArray(wallet.practicePositions)) wallet.practicePositions = [];
       if (wallet.practiceRealizedPnlUsdt === undefined) wallet.practiceRealizedPnlUsdt = 0;
       if (!Array.isArray(wallet.practiceTradeHistory)) wallet.practiceTradeHistory = [];
       if (!wallet.practiceStats) wallet.practiceStats = { totalTrades: 0, winTrades: 0, lossTrades: 0 };
       if (!Array.isArray(wallet.followedTargets)) wallet.followedTargets = [];
+      if (!wallet.language && telegramLanguageCode) {
+        wallet.language = detectTelegramLang(telegramLanguageCode);
+        dirty = true;
+      }
+      if (username && wallet.username !== username) {
+        wallet.username = username;
+        dirty = true;
+      }
+      if (dirty) this.saveWallets();
     }
     return wallet;
+  }
+
+  public getUserLanguage(telegramId: number, telegramLanguageCode?: string): BotLang {
+    const wallet = this.wallets.get(telegramId);
+    if (wallet?.language) return wallet.language;
+    if (telegramLanguageCode) {
+      const detected = detectTelegramLang(telegramLanguageCode);
+      if (wallet) {
+        wallet.language = detected;
+        this.saveWallets();
+      }
+      return detected;
+    }
+    return 'zh';
+  }
+
+  public setUserLanguage(telegramId: number, lang: BotLang): BotLang {
+    const wallet = this.getOrCreateWallet(telegramId);
+    wallet.language = lang;
+    this.saveWallets();
+    return lang;
   }
 
   /**

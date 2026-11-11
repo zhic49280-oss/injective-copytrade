@@ -2,6 +2,7 @@ import { Bot, InlineKeyboard } from 'grammy';
 import { IndexerGrpcDerivativesApi, getInjectiveAddressFromSubaccountId } from '@injectivelabs/sdk-ts';
 import { getNetworkEndpoints, Network } from '@injectivelabs/networks';
 import { AppConfig } from '../config/index.js';
+import { BotLang } from '../i18n.js';
 import { KNOWN_MARKET_MAKERS, isMarketMakerOrHftBot } from './leaderboard.service.js';
 
 export interface WhaleAlert {
@@ -37,6 +38,7 @@ export class WhaleRadarService {
   private majorMarketIds: string[] = [];
   private otherMarketIds: string[] = [];
   private otherScanCursor: number = 0;
+  private languageResolver?: (chatId: number) => BotLang;
   // 巨鲸雷达最小播报门槛：至少 $2,000 USD 以上的大额主动吃单才配叫巨鲸异动！
   private minWhaleNotionalUsd: number = 2000;
 
@@ -48,6 +50,10 @@ export class WhaleRadarService {
       getNetworkEndpoints(Network.MainnetSentry).indexer
     );
     this.bot = bot;
+  }
+
+  public setLanguageResolver(resolver: (chatId: number) => BotLang) {
+    this.languageResolver = resolver;
   }
 
   private rememberBounded(set: Set<string>, key: string) {
@@ -374,6 +380,35 @@ export class WhaleRadarService {
     }
   }
 
+  private formatWhaleAlertText(alert: WhaleAlert, lang: BotLang): string {
+    const isBuy = alert.direction === 'BUY';
+    const priceStr = alert.price.toLocaleString('en-US', { maximumSignificantDigits: 6 });
+    if (lang === 'en') {
+      return `
+🚨 <b>[Injective Mainnet Whale Trade Alert]</b>
+
+• <b>Market</b>: <code>${alert.marketTicker}</code>
+• <b>Side</b>: ${isBuy ? '🟢 Aggressive LONG (BUY)' : '🔴 Aggressive SHORT (SELL)'}
+• <b>Fill Price</b>: <b>$${priceStr}</b>
+• <b>Position Value</b>: <b>$${alert.notionalUsd.toLocaleString()} USD</b> (${alert.quantity} contracts)
+• <b>Whale Address</b>: <code>${alert.traderAddress}</code>
+----------------------------------------
+⚡ <i>Large directional mainnet taker trade detected. Tap below to copy-trade this whale!</i>
+      `.trim();
+    }
+    return `
+🚨 <b>【Injective 主网巨鲸大单异动提醒】</b>
+
+• <b>交易合约</b>: <code>${alert.marketTicker}</code>
+• <b>异动方向</b>: ${isBuy ? '🟢 巨鲸主动买入做多 (LONG)' : '🔴 巨鲸主动卖出做空 (SHORT)'}
+• <b>成交均价</b>: <b>$${priceStr}</b>
+• <b>仓位价值</b>: <b>$${alert.notionalUsd.toLocaleString()} USD</b> (${alert.quantity} 张)
+• <b>巨鲸地址</b>: <code>${alert.traderAddress}</code>
+----------------------------------------
+⚡ <i>主网实盘大额异动，点击下方按钮可一键跟随该巨鲸！</i>
+    `.trim();
+  }
+
   /**
    * 向订阅用户及广播频道推送真正的大额巨鲸异动提醒 (分批并发推送 + 自动清理已拉黑用户，防止阻塞与 429 限流)
    */
@@ -382,29 +417,25 @@ export class WhaleRadarService {
     if (this.subscriberChatIds.size === 0 && !this.config.telegramBroadcastChatId) return;
 
     const isBuy = alert.direction === 'BUY';
-    const text = `
-🚨 <b>【Injective 主网巨鲸大单异动提醒】</b>
-
-• <b>交易合约</b>: <code>${alert.marketTicker}</code>
-• <b>异动方向</b>: ${isBuy ? '🟢 巨鲸主动买入做多 (LONG)' : '🔴 巨鲸主动卖出做空 (SHORT)'}
-• <b>成交均价</b>: <b>$${alert.price.toLocaleString('en-US', { maximumSignificantDigits: 6 })}</b>
-• <b>仓位价值</b>: <b>$${alert.notionalUsd.toLocaleString()} USD</b> (${alert.quantity} 张)
-• <b>巨鲸地址</b>: <code>${alert.traderAddress}</code>
-----------------------------------------
-⚡ <i>主网实盘大额异动，点击下方按钮可一键跟随该巨鲸！</i>
-    `.trim();
+    const channelLang: BotLang =
+      (process.env.CHANNEL_LANGUAGE || '').toLowerCase() === 'en' ? 'en' : 'zh';
 
     // 广播频道/群聊使用深链 ?start=follow_<addr>，点击直接跳入私聊锁定该巨鲸
     if (this.config.telegramBroadcastChatId) {
       const botUsername = this.bot.botInfo?.username;
+      const channelText = this.formatWhaleAlertText(alert, channelLang);
+      const channelBtnLabel =
+        channelLang === 'en'
+          ? `⚡ Copy This Whale (${isBuy ? 'LONG' : 'SHORT'})`
+          : `⚡ 一键跟单此巨鲸 (${isBuy ? '做多' : '做空'})`;
       const channelKb = botUsername
         ? new InlineKeyboard().url(
-            `⚡ 一键跟单此巨鲸 (${isBuy ? '做多' : '做空'})`,
+            channelBtnLabel,
             `https://t.me/${botUsername}?start=follow_${alert.traderAddress}`
           )
         : undefined;
       await this.bot.api
-        .sendMessage(this.config.telegramBroadcastChatId, text, {
+        .sendMessage(this.config.telegramBroadcastChatId, channelText, {
           parse_mode: 'HTML',
           reply_markup: channelKb,
         })
@@ -413,11 +444,30 @@ export class WhaleRadarService {
 
     if (this.subscriberChatIds.size === 0) return;
 
-    const keyboard = new InlineKeyboard()
-      .text(`⚡ 一键跟单此巨鲸 (${isBuy ? '做多' : '做空'})`, `follow_custom_${alert.traderAddress}`)
-      .row()
-      .text('🏆 查看聪明钱排行榜', 'view_leaderboard')
-      .text('👛 我的钱包', 'view_wallet');
+    const dmTextCache = new Map<BotLang, string>();
+    const dmKbCache = new Map<BotLang, InlineKeyboard>();
+    const getDmPayload = (lang: BotLang) => {
+      let text = dmTextCache.get(lang);
+      let keyboard = dmKbCache.get(lang);
+      if (!text || !keyboard) {
+        text = this.formatWhaleAlertText(alert, lang);
+        keyboard =
+          lang === 'en'
+            ? new InlineKeyboard()
+                .text(`⚡ Copy Whale (${isBuy ? 'LONG' : 'SHORT'})`, `follow_custom_${alert.traderAddress}`)
+                .row()
+                .text('🏆 Leaderboard', 'view_leaderboard')
+                .text('👛 My Wallet', 'view_wallet')
+            : new InlineKeyboard()
+                .text(`⚡ 一键跟单此巨鲸 (${isBuy ? '做多' : '做空'})`, `follow_custom_${alert.traderAddress}`)
+                .row()
+                .text('🏆 查看聪明钱排行榜', 'view_leaderboard')
+                .text('👛 我的钱包', 'view_wallet');
+        dmTextCache.set(lang, text);
+        dmKbCache.set(lang, keyboard);
+      }
+      return { text, keyboard };
+    };
 
     const chatIds = Array.from(this.subscriberChatIds);
     const batchSize = 15;
@@ -426,6 +476,8 @@ export class WhaleRadarService {
       await Promise.all(
         batch.map(async (chatId) => {
           try {
+            const lang: BotLang = this.languageResolver ? this.languageResolver(chatId) : 'zh';
+            const { text, keyboard } = getDmPayload(lang);
             await this.bot!.api.sendMessage(chatId, text, {
               parse_mode: 'HTML',
               reply_markup: keyboard,

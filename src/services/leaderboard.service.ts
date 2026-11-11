@@ -204,6 +204,13 @@ export interface WhaleProfile {
   marginUsd: number;            // 当前链上实盘占用总保证金 (Margin USD)
   favoriteMarket: string;       // 头号重仓盈利标的
   strategy: string;             // 真实重仓明细描述 (如: 做多 INJ/USDC PERP 浮盈 +$14,685)
+  bestPosition?: {
+    ticker: string;
+    direction: 'LONG' | 'SHORT';
+    upnlUsd: number;
+    entryPrice: number;
+    markPrice: number;
+  };
   isRealOnChain: boolean;
   lastActiveTime?: number;
   lastTradeMinutesAgo?: number; // 距离最近一笔真实链上成交的分钟数
@@ -570,6 +577,15 @@ export class LeaderboardService {
           marginUsd: Math.round(item.totalMarginUsd),
           favoriteMarket: best ? best.ticker : 'INJ/USDC PERP',
           strategy: bestDesc,
+          bestPosition: best
+            ? {
+                ticker: best.ticker,
+                direction: best.direction.includes('LONG') ? 'LONG' : 'SHORT',
+                upnlUsd: Math.round(best.upnlUsd),
+                entryPrice: best.entryPrice,
+                markPrice: best.markPrice,
+              }
+            : undefined,
           isRealOnChain: true,
           lastActiveTime: lastTradeTimestamp || Date.now(),
           lastTradeMinutesAgo,
