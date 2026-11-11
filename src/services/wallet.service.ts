@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import { PrivateKey, getSubaccountId, IndexerGrpcAccountPortfolioApi } from '@injectivelabs/sdk-ts';
 import BigNumber from 'bignumber.js';
 import { AppConfig } from '../config/index.js';
+import { CopyMode } from '../types/index.js';
 import { KNOWN_MARKET_MAKERS } from './leaderboard.service.js';
 
 export interface PracticePosition {
@@ -37,7 +38,17 @@ export interface PracticeStats {
 export interface FollowedTarget {
   address: string;
   name: string;
+  subaccountIndex?: number;
   addedAt: number;
+}
+
+export interface ReferralPayoutRecord {
+  id: string;
+  amountUsdt: number;
+  toAddress: string;
+  status: 'PENDING_PAYOUT' | 'PAID';
+  txHash?: string;
+  createdAt: number;
 }
 
 export interface UserWallet {
@@ -48,6 +59,7 @@ export interface UserWallet {
   subaccountId: string;
   privateKeyHex: string;
   mnemonic?: string;
+  decryptionError?: boolean;
   createdAt: number;
   practiceMode?: boolean;
   practiceBalanceUsdt?: number;
@@ -59,11 +71,25 @@ export interface UserWallet {
   targetTraderAddress?: string;
   targetTraderName?: string;
   followedTargets?: FollowedTarget[];
+  copyMode?: CopyMode;
   copyAmountUsdt?: number;
+  copyRatio?: number;
+  maxSlippagePercent?: number;
+  maxLeverage?: number;
+  maxNotionalPerOrder?: number;
   referrerId?: number;
   referralEarningsUsdt?: number;
   referralVolumeUsdt?: number;
   referralWithdrawnUsdt?: number;
+  referralPayouts?: ReferralPayoutRecord[];
+  realPositionOwners?: Record<
+    string,
+    {
+      direction: 'BUY' | 'SELL';
+      traderAddresses: string[];
+      updatedAt: number;
+    }
+  >;
 }
 
 export class WalletService {
@@ -72,18 +98,46 @@ export class WalletService {
   private storageFile: string;
   private wallets: Map<number, UserWallet> = new Map();
   private encryptionKey: Buffer;
+  private legacyDecryptionKeys: Buffer[] = [];
 
   constructor(config: AppConfig, endpoints: { indexer: string }) {
     this.config = config;
     this.portfolioApi = new IndexerGrpcAccountPortfolioApi(endpoints.indexer);
     this.storageFile = path.resolve(process.cwd(), 'data', 'wallets.json');
 
-    // 初始化金融级 AES-256-GCM 主加密密钥 (杜绝明文私钥/助记词在硬盘落地存储)
-    const masterSeed =
-      process.env.WALLET_ENCRYPTION_SECRET ||
-      process.env.TELEGRAM_BOT_TOKEN ||
-      'injective-copytrade-vault-master-seed-2026';
+    const dataDir = path.dirname(this.storageFile);
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+
+    // 主加密密钥: 优先使用 WALLET_ENCRYPTION_SECRET；未配置时自动生成并持久化独立随机密钥文件 (.vault.key)
+    let masterSeed = process.env.WALLET_ENCRYPTION_SECRET || '';
+    if (!masterSeed) {
+      if (process.env.TELEGRAM_BOT_TOKEN) {
+        masterSeed = process.env.TELEGRAM_BOT_TOKEN;
+      } else {
+        const keyFile = path.join(dataDir, '.vault.key');
+        if (fs.existsSync(keyFile)) {
+          masterSeed = fs.readFileSync(keyFile, 'utf-8').trim();
+        } else {
+          masterSeed = crypto.randomBytes(32).toString('hex');
+          fs.writeFileSync(keyFile, masterSeed, { encoding: 'utf-8', mode: 0o600 });
+        }
+      }
+    }
     this.encryptionKey = crypto.createHash('sha256').update(masterSeed).digest();
+
+    // 兼容迁移旧版派生密钥（避免 VPS 补充 WALLET_ENCRYPTION_SECRET 后历史钱包无法解密）
+    const keyFile = path.join(dataDir, '.vault.key');
+    const vaultKeyFromDisk = fs.existsSync(keyFile) ? fs.readFileSync(keyFile, 'utf-8').trim() : undefined;
+    const legacySeeds = [
+      process.env.TELEGRAM_BOT_TOKEN,
+      vaultKeyFromDisk,
+      'injective-copytrade-vault-master-seed-2026',
+    ].filter((s): s is string => Boolean(s && s !== masterSeed));
+    for (const seed of legacySeeds) {
+      this.legacyDecryptionKeys.push(crypto.createHash('sha256').update(seed).digest());
+    }
 
     this.loadWallets();
   }
@@ -94,41 +148,49 @@ export class WalletService {
   public encryptSecret(text?: string): string {
     if (!text) return '';
     if (text.startsWith('enc:v1:')) return text;
-    try {
-      const iv = crypto.randomBytes(12);
-      const cipher = crypto.createCipheriv('aes-256-gcm', this.encryptionKey, iv);
-      let encrypted = cipher.update(text, 'utf8', 'hex');
-      encrypted += cipher.final('hex');
-      const tag = cipher.getAuthTag();
-      return `enc:v1:${iv.toString('hex')}:${tag.toString('hex')}:${encrypted}`;
-    } catch {
-      return text;
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', this.encryptionKey, iv);
+    let encrypted = cipher.update(text, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const tag = cipher.getAuthTag();
+    return `enc:v1:${iv.toString('hex')}:${tag.toString('hex')}:${encrypted}`;
+  }
+
+  private tryDecryptWithKey(ciphertext: string, key: Buffer): string {
+    const parts = ciphertext.split(':');
+    if (parts.length !== 5) {
+      throw new Error('密文格式损坏');
     }
+    const iv = Buffer.from(parts[2], 'hex');
+    const tag = Buffer.from(parts[3], 'hex');
+    const encrypted = parts[4];
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
   }
 
   /**
-   * 解密 AES-256-GCM 密文私钥（同时透明兼容历史旧版明文并触发自动升级迁移）
+   * 解密 AES-256-GCM 密文私钥（支持历史明文与旧派生密钥平滑迁移，解密失败不伪装成明文）
    */
   public decryptSecret(ciphertext?: string): string {
     if (!ciphertext) return '';
     if (!ciphertext.startsWith('enc:v1:')) {
-      // 历史明文私钥：原样返回并触发后续自动加密持久化
       return ciphertext;
     }
+
     try {
-      const parts = ciphertext.split(':');
-      if (parts.length !== 5) return ciphertext;
-      const iv = Buffer.from(parts[2], 'hex');
-      const tag = Buffer.from(parts[3], 'hex');
-      const encrypted = parts[4];
-      const decipher = crypto.createDecipheriv('aes-256-gcm', this.encryptionKey, iv);
-      decipher.setAuthTag(tag);
-      let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-      decrypted += decipher.final('utf8');
-      return decrypted;
-    } catch (e: any) {
-      console.warn('[WalletService] 私钥解密告警:', e.message);
-      return ciphertext;
+      return this.tryDecryptWithKey(ciphertext, this.encryptionKey);
+    } catch {
+      for (const legacyKey of this.legacyDecryptionKeys) {
+        try {
+          return this.tryDecryptWithKey(ciphertext, legacyKey);
+        } catch {
+          // continue trying legacy keys
+        }
+      }
+      throw new Error('AES-256-GCM 私钥解密失败：主加密密钥不匹配或密文已损坏');
     }
   }
 
@@ -185,24 +247,28 @@ export class WalletService {
   }
 
   /**
-   * 自动将历史碎片化模拟持仓（如同一标的上百笔拆分持仓）合并为每个 marketTicker 最多 1 笔净持仓
+   * 自动将历史碎片化模拟持仓（同一标的 + 同一巨鲸归属）合并为每组最多 1 笔净持仓，杜绝跨巨鲸多空仓位被误平仓
    */
   public consolidatePracticePositions(item: UserWallet): boolean {
     if (!Array.isArray(item.practicePositions) || item.practicePositions.length <= 1) {
       return false;
     }
 
-    const seenTickers = new Set<string>();
-    let hasDuplicateTicker = false;
+    const posKey = (p: PracticePosition) =>
+      `${p.marketTicker}::${(p.traderAddress || '').toLowerCase()}`;
+
+    const seenKeys = new Set<string>();
+    let hasDuplicateKey = false;
     for (const p of item.practicePositions) {
-      if (seenTickers.has(p.marketTicker)) {
-        hasDuplicateTicker = true;
+      const k = posKey(p);
+      if (seenKeys.has(k)) {
+        hasDuplicateKey = true;
         break;
       }
-      seenTickers.add(p.marketTicker);
+      seenKeys.add(k);
     }
 
-    if (!hasDuplicateTicker) {
+    if (!hasDuplicateKey) {
       return false;
     }
 
@@ -213,18 +279,19 @@ export class WalletService {
       item.practiceStats = { totalTrades: 0, winTrades: 0, lossTrades: 0 };
     }
 
-    const netByTicker = new Map<string, PracticePosition>();
+    const netByKey = new Map<string, PracticePosition>();
     for (const pos of item.practicePositions) {
-      const existing = netByTicker.get(pos.marketTicker);
+      const key = posKey(pos);
+      const existing = netByKey.get(key);
       if (!existing) {
-        netByTicker.set(pos.marketTicker, { ...pos });
+        netByKey.set(key, { ...pos });
       } else if (existing.direction === pos.direction) {
         // 同向加仓：加权平均计算开仓均价并合并数量与保证金
         const newQty = Number((existing.quantity + pos.quantity).toFixed(6));
         const avgEntry =
           newQty > 0
             ? Number(
-                ((existing.entryPrice * existing.quantity + pos.entryPrice * pos.quantity) / newQty).toFixed(6)
+                ((existing.entryPrice * existing.quantity + pos.entryPrice * pos.quantity) / newQty).toPrecision(8)
               )
             : existing.entryPrice;
         existing.quantity = newQty;
@@ -239,10 +306,11 @@ export class WalletService {
             ? (pos.entryPrice - existing.entryPrice) * existing.quantity
             : (existing.entryPrice - pos.entryPrice) * existing.quantity;
         const fee = pos.entryPrice * existing.quantity * 0.001;
-        const netPnl = Number((grossPnl - fee).toFixed(2));
+        const rawNetPnl = Number((grossPnl - fee).toFixed(2));
+        const netPnl = Math.max(-Number((existing.marginUsdt || 0).toFixed(2)), rawNetPnl);
 
         item.practiceBalanceUsdt = Number(
-          (item.practiceBalanceUsdt + (existing.marginUsdt || 0) + (pos.marginUsdt || 0) + netPnl).toFixed(2)
+          Math.max(0, item.practiceBalanceUsdt + (existing.marginUsdt || 0) + (pos.marginUsdt || 0) + netPnl).toFixed(2)
         );
         item.practiceRealizedPnlUsdt = Number((item.practiceRealizedPnlUsdt + netPnl).toFixed(2));
         item.practiceStats.totalTrades += 1;
@@ -261,103 +329,134 @@ export class WalletService {
         if (item.practiceTradeHistory.length > 20) {
           item.practiceTradeHistory = item.practiceTradeHistory.slice(0, 20);
         }
-        netByTicker.delete(pos.marketTicker);
+        netByKey.delete(key);
       }
     }
 
-    item.practicePositions = Array.from(netByTicker.values());
+    item.practicePositions = Array.from(netByKey.values());
     return true;
   }
 
   private loadWallets() {
+    const parseFile = (filePath: string): UserWallet[] | null => {
+      if (!fs.existsSync(filePath)) return null;
+      const raw = fs.readFileSync(filePath, 'utf-8').trim();
+      if (!raw) return null;
+      return JSON.parse(raw);
+    };
+
     try {
       const dir = path.dirname(this.storageFile);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-      if (fs.existsSync(this.storageFile)) {
-        const raw = fs.readFileSync(this.storageFile, 'utf-8');
-        const list: UserWallet[] = JSON.parse(raw);
-        let dirtyFixed = false;
-        for (const item of list) {
-          // 自动解密私钥与助记词 (若读取到历史明文，标记 dirtyFixed=true 触发自动加密回写)
-          if (item.privateKeyHex) {
-            if (!item.privateKeyHex.startsWith('enc:v1:')) {
-              dirtyFixed = true;
-            }
-            item.privateKeyHex = this.decryptSecret(item.privateKeyHex);
-          }
-          if (item.mnemonic) {
-            if (!item.mnemonic.startsWith('enc:v1:')) {
-              dirtyFixed = true;
-            }
-            item.mnemonic = this.decryptSecret(item.mnemonic);
-          }
 
-          if (this.sanitizeAndMigrateTargets(item)) {
+      let list: UserWallet[] | null = null;
+      try {
+        list = parseFile(this.storageFile);
+      } catch (err: any) {
+        console.error('[WalletService] 主钱包文件读取损坏，尝试从 .bak 备份恢复:', err.message);
+        const bakFile = `${this.storageFile}.bak`;
+        list = parseFile(bakFile);
+      }
+
+      if (!list) return;
+
+      let dirtyFixed = false;
+      for (const item of list) {
+        // 自动解密私钥与助记词 (若读取到历史明文或旧密钥密文，标记 dirtyFixed=true 触发自动加密迁移)
+        if (item.privateKeyHex) {
+          if (!item.privateKeyHex.startsWith('enc:v1:')) {
             dirtyFixed = true;
           }
-          if (item.practiceBalanceUsdt === undefined) {
-            item.practiceBalanceUsdt = 10000;
-          }
-          if (!Array.isArray(item.practicePositions)) {
-            item.practicePositions = [];
-          } else {
-            // 自动检测并修复历史异常开仓价（如早期未除以精度的小市值代币如 BRETT 等）
-            for (const pos of item.practicePositions) {
-              if (pos.marketTicker && pos.marketTicker.toUpperCase().includes('BRETT') && pos.entryPrice > 10) {
-                pos.entryPrice = Number((pos.entryPrice / 1e6).toFixed(6));
-                dirtyFixed = true;
-              }
-              // 自动修复历史开仓价为 0 或保证金为 0 的异常代币 (如早期 PEPE)
-              if ((!pos.entryPrice || pos.entryPrice <= 0 || !pos.marginUsdt) && pos.marketTicker) {
-                if (pos.marketTicker.toUpperCase().includes('PEPE')) {
-                  pos.entryPrice = 0.00000514;
-                  pos.marginUsdt = Number(((pos.quantity * pos.entryPrice) / (pos.leverage || 5)).toFixed(2)) || 10;
-                  dirtyFixed = true;
-                }
-              }
-            }
-            // 剔除任何依然无法解析真实价格 (entryPrice <= 0) 的脏数据持仓
-            const beforeLen = item.practicePositions.length;
-            item.practicePositions = item.practicePositions.filter((p) => p.entryPrice > 0 && p.quantity > 0);
-            if (item.practicePositions.length !== beforeLen) {
-              dirtyFixed = true;
-            }
-          }
-          if (item.practiceRealizedPnlUsdt === undefined) {
-            item.practiceRealizedPnlUsdt = 0;
-          }
-          if (!Array.isArray(item.practiceTradeHistory)) {
-            item.practiceTradeHistory = [];
-          } else {
-            for (const th of item.practiceTradeHistory) {
-              if (th.marketTicker && th.marketTicker.toUpperCase().includes('BRETT') && th.entryPrice > 10) {
-                th.entryPrice = Number((th.entryPrice / 1e6).toFixed(6));
+          try {
+            const decryptedPk = this.decryptSecret(item.privateKeyHex);
+            // 若旧密钥迁移过，保存时用当前主密钥重加密
+            if (item.privateKeyHex.startsWith('enc:v1:')) {
+              try {
+                this.tryDecryptWithKey(item.privateKeyHex, this.encryptionKey);
+              } catch {
                 dirtyFixed = true;
               }
             }
+            item.privateKeyHex = decryptedPk;
+            item.decryptionError = false;
+          } catch (e: any) {
+            console.error(`[WalletService] 用户 ${item.telegramId} 私钥解密失败:`, e.message);
+            item.decryptionError = true;
           }
-          if (!item.practiceStats) {
-            item.practiceStats = { totalTrades: 0, winTrades: 0, lossTrades: 0 };
-          }
-          if (!item.evmAddress && item.privateKeyHex) {
-            try {
-              const cleanPk = item.privateKeyHex.startsWith('0x') ? item.privateKeyHex : `0x${item.privateKeyHex}`;
-              item.evmAddress = PrivateKey.fromHex(cleanPk).toAddress().toHex();
-              dirtyFixed = true;
-            } catch {
-              // ignore
-            }
-          }
-          if (this.consolidatePracticePositions(item)) {
+        }
+        if (item.mnemonic) {
+          if (!item.mnemonic.startsWith('enc:v1:')) {
             dirtyFixed = true;
           }
-          this.wallets.set(item.telegramId, item);
+          try {
+            item.mnemonic = this.decryptSecret(item.mnemonic);
+          } catch {
+            // 保留原密文以免被覆盖
+          }
         }
-        if (dirtyFixed) {
-          this.saveWallets();
+
+        if (this.sanitizeAndMigrateTargets(item)) {
+          dirtyFixed = true;
         }
+        if (item.practiceBalanceUsdt === undefined) {
+          item.practiceBalanceUsdt = 10000;
+        }
+        if (!Array.isArray(item.practicePositions)) {
+          item.practicePositions = [];
+        } else {
+          for (const pos of item.practicePositions) {
+            if (pos.marketTicker && pos.marketTicker.toUpperCase().includes('BRETT') && pos.entryPrice > 10) {
+              pos.entryPrice = Number((pos.entryPrice / 1e6).toFixed(6));
+              dirtyFixed = true;
+            }
+            if ((!pos.entryPrice || pos.entryPrice <= 0 || !pos.marginUsdt) && pos.marketTicker) {
+              if (pos.marketTicker.toUpperCase().includes('PEPE')) {
+                pos.entryPrice = 0.00000514;
+                pos.marginUsdt = Number(((pos.quantity * pos.entryPrice) / (pos.leverage || 5)).toFixed(2)) || 10;
+                dirtyFixed = true;
+              }
+            }
+          }
+          const beforeLen = item.practicePositions.length;
+          item.practicePositions = item.practicePositions.filter((p) => p.entryPrice > 0 && p.quantity > 0);
+          if (item.practicePositions.length !== beforeLen) {
+            dirtyFixed = true;
+          }
+        }
+        if (item.practiceRealizedPnlUsdt === undefined) {
+          item.practiceRealizedPnlUsdt = 0;
+        }
+        if (!Array.isArray(item.practiceTradeHistory)) {
+          item.practiceTradeHistory = [];
+        } else {
+          for (const th of item.practiceTradeHistory) {
+            if (th.marketTicker && th.marketTicker.toUpperCase().includes('BRETT') && th.entryPrice > 10) {
+              th.entryPrice = Number((th.entryPrice / 1e6).toFixed(6));
+              dirtyFixed = true;
+            }
+          }
+        }
+        if (!item.practiceStats) {
+          item.practiceStats = { totalTrades: 0, winTrades: 0, lossTrades: 0 };
+        }
+        if (!item.evmAddress && item.privateKeyHex && !item.decryptionError) {
+          try {
+            const cleanPk = item.privateKeyHex.startsWith('0x') ? item.privateKeyHex : `0x${item.privateKeyHex}`;
+            item.evmAddress = PrivateKey.fromHex(cleanPk).toAddress().toHex();
+            dirtyFixed = true;
+          } catch {
+            // ignore
+          }
+        }
+        if (this.consolidatePracticePositions(item)) {
+          dirtyFixed = true;
+        }
+        this.wallets.set(item.telegramId, item);
+      }
+      if (dirtyFixed) {
+        this.saveWallets();
       }
     } catch (e: any) {
       console.warn('[WalletService] 钱包载入警告:', e.message);
@@ -371,12 +470,29 @@ export class WalletService {
         fs.mkdirSync(dir, { recursive: true });
       }
       const list = Array.from(this.wallets.values());
-      const encryptedList = list.map((item) => ({
-        ...item,
-        privateKeyHex: this.encryptSecret(item.privateKeyHex),
-        mnemonic: item.mnemonic ? this.encryptSecret(item.mnemonic) : undefined,
-      }));
-      fs.writeFileSync(this.storageFile, JSON.stringify(encryptedList, null, 2), 'utf-8');
+      const encryptedList = list.map((item) => {
+        const copy = { ...item };
+        delete copy.decryptionError;
+        return {
+          ...copy,
+          privateKeyHex: this.encryptSecret(item.privateKeyHex),
+          mnemonic: item.mnemonic ? this.encryptSecret(item.mnemonic) : undefined,
+        };
+      });
+
+      const payload = JSON.stringify(encryptedList, null, 2);
+      const tmpFile = `${this.storageFile}.tmp.${process.pid}`;
+      const bakFile = `${this.storageFile}.bak`;
+
+      fs.writeFileSync(tmpFile, payload, { encoding: 'utf-8', mode: 0o600 });
+      if (fs.existsSync(this.storageFile)) {
+        try {
+          fs.copyFileSync(this.storageFile, bakFile);
+        } catch {
+          // best effort backup
+        }
+      }
+      fs.renameSync(tmpFile, this.storageFile);
     } catch (e: any) {
       console.error('[WalletService] 钱包持久化失败:', e.message);
     }
@@ -457,7 +573,7 @@ export class WalletService {
   }
 
   /**
-   * 执行模拟体验金交易 (确保每个 marketTicker 最多 1 笔净持仓：同向加权合并均价，反向平仓结算盈亏并计入历史)
+   * 执行模拟体验金交易 (确保同一标+同一巨鲸最多 1 笔净持仓：同向加权合并均价，反向平仓结算盈亏并计入历史)
    */
   public executePracticeTrade(
     telegramId: number,
@@ -481,7 +597,7 @@ export class WalletService {
     traderAddressArg?: string
   ): {
     success: boolean;
-    action: 'OPEN' | 'CLOSE';
+    action: 'OPEN' | 'CLOSE' | 'SKIPPED';
     wallet: UserWallet;
     realizedPnlDelta: number;
     closedPosition?: PracticeTradeHistoryItem;
@@ -529,13 +645,13 @@ export class WalletService {
     if (existingIdx !== -1 && wallet.practicePositions[existingIdx].direction !== params.direction) {
       const existing = wallet.practicePositions[existingIdx];
 
-      // 防高频闪电对敲洗盘保护：若持仓开仓不足 45 秒且价格未出现明显波动 (< 0.4%)，避免被高频做市商秒翻转反复摩擦手续费
+      // 防高频闪电对敲洗盘保护：若持仓开仓不足 45 秒且价格未出现明显波动 (< 0.4%)，跳过本次反向信号
       const holdTimeSec = (Date.now() - (existing.timestamp || 0)) / 1000;
       const priceChangePct = Math.abs((params.price - existing.entryPrice) / (existing.entryPrice || 1)) * 100;
       if (holdTimeSec < 45 && priceChangePct < 0.4) {
         return {
           success: true,
-          action: 'OPEN',
+          action: 'SKIPPED',
           wallet,
           realizedPnlDelta: 0,
         };
@@ -551,10 +667,12 @@ export class WalletService {
         grossPnl = grossPnl > 0 ? maxPnlCap : -maxPnlCap;
       }
       const fee = params.price * existing.quantity * 0.001;
-      const netPnl = Number((grossPnl - fee).toFixed(2));
+      const rawNetPnl = Number((grossPnl - fee).toFixed(2));
+      // 逐仓爆仓保护：单笔净亏损最多亏光该仓位保证金
+      const netPnl = Math.max(-Number((existing.marginUsdt || 0).toFixed(2)), rawNetPnl);
 
       wallet.practiceBalanceUsdt = Number(
-        (wallet.practiceBalanceUsdt + existing.marginUsdt + netPnl).toFixed(2)
+        Math.max(0, wallet.practiceBalanceUsdt + existing.marginUsdt + netPnl).toFixed(2)
       );
       wallet.practiceRealizedPnlUsdt = Number((wallet.practiceRealizedPnlUsdt + netPnl).toFixed(2));
 
@@ -852,7 +970,7 @@ export class WalletService {
   }
 
   /**
-   * 获取用户个性化跟单配置与状态 (内置脏数据自愈保护)
+   * 获取用户个性化跟单配置与状态 (内置脏数据自愈保护，绝不共用全局可变量)
    */
   public getUserCopyState(telegramId: number) {
     const wallet = this.getOrCreateWallet(telegramId);
@@ -864,7 +982,12 @@ export class WalletService {
       targetTraderAddress: wallet.targetTraderAddress,
       targetTraderName: wallet.targetTraderName,
       followedTargets: wallet.followedTargets || [],
-      copyAmountUsdt: wallet.copyAmountUsdt || 100,
+      copyMode: wallet.copyMode || this.config.copyMode,
+      copyAmountUsdt: wallet.copyAmountUsdt || this.config.fixedUsdtAmount || 100,
+      copyRatio: wallet.copyRatio ?? this.config.copyRatio,
+      maxSlippagePercent: wallet.maxSlippagePercent ?? this.config.maxSlippagePercent,
+      maxLeverage: wallet.maxLeverage ?? this.config.maxLeverage,
+      maxNotionalPerOrder: wallet.maxNotionalPerOrder ?? this.config.maxNotionalPerOrder,
       practiceMode: !!wallet.practiceMode,
     };
   }
@@ -875,7 +998,8 @@ export class WalletService {
   public addUserTarget(
     telegramId: number,
     address: string,
-    name?: string
+    name?: string,
+    subaccountIndex: number = 0
   ): { added: boolean; targets: FollowedTarget[] } {
     const wallet = this.getOrCreateWallet(telegramId);
     if (!Array.isArray(wallet.followedTargets)) {
@@ -895,11 +1019,15 @@ export class WalletService {
       wallet.followedTargets.push({
         address,
         name: displayName,
+        subaccountIndex,
         addedAt: Date.now(),
       });
       added = true;
     } else {
       wallet.followedTargets[existingIdx].name = displayName;
+      if (subaccountIndex !== undefined) {
+        wallet.followedTargets[existingIdx].subaccountIndex = subaccountIndex;
+      }
     }
 
     wallet.targetTraderAddress = address;
@@ -951,20 +1079,40 @@ export class WalletService {
   }
 
   /**
-   * 汇总所有开启了 isCopyingEnabled 的用户正在跟单的所有去重巨鲸地址列表
+   * 汇总所有开启了 isCopyingEnabled 的用户正在跟单的所有去重巨鲸目标 (含子账户索引)
    */
-  public getAllActiveTrackedAddresses(): string[] {
-    const activeSet = new Set<string>();
+  public getAllActiveTrackedTargets(): Array<{ address: string; subaccountIndex: number }> {
+    const activeMap = new Map<string, { address: string; subaccountIndex: number }>();
     for (const wallet of this.wallets.values()) {
       if (!wallet.isCopyingEnabled) continue;
       if (Array.isArray(wallet.followedTargets)) {
         for (const t of wallet.followedTargets) {
-          if (t.address) activeSet.add(t.address);
+          if (t.address) {
+            const idx = t.subaccountIndex ?? 0;
+            activeMap.set(`${t.address.toLowerCase()}:${idx}`, {
+              address: t.address,
+              subaccountIndex: idx,
+            });
+          }
         }
       }
       if (wallet.targetTraderAddress) {
-        activeSet.add(wallet.targetTraderAddress);
+        const key = `${wallet.targetTraderAddress.toLowerCase()}:0`;
+        if (!activeMap.has(key)) {
+          activeMap.set(key, { address: wallet.targetTraderAddress, subaccountIndex: 0 });
+        }
       }
+    }
+    return Array.from(activeMap.values());
+  }
+
+  /**
+   * 汇总所有开启了 isCopyingEnabled 的用户正在跟单的所有去重巨鲸地址列表
+   */
+  public getAllActiveTrackedAddresses(): string[] {
+    const activeSet = new Set<string>();
+    for (const t of this.getAllActiveTrackedTargets()) {
+      activeSet.add(t.address);
     }
     return Array.from(activeSet);
   }
@@ -1008,6 +1156,34 @@ export class WalletService {
     return wallet;
   }
 
+  public setUserCopyMode(telegramId: number, mode: CopyMode): UserWallet {
+    const wallet = this.getOrCreateWallet(telegramId);
+    wallet.copyMode = mode;
+    this.saveWallets();
+    return wallet;
+  }
+
+  public setUserSlippage(telegramId: number, maxSlippagePercent: number): UserWallet {
+    const wallet = this.getOrCreateWallet(telegramId);
+    wallet.maxSlippagePercent = maxSlippagePercent;
+    this.saveWallets();
+    return wallet;
+  }
+
+  public setUserLeverage(telegramId: number, maxLeverage: number): UserWallet {
+    const wallet = this.getOrCreateWallet(telegramId);
+    wallet.maxLeverage = maxLeverage;
+    this.saveWallets();
+    return wallet;
+  }
+
+  public setUserMaxNotional(telegramId: number, maxNotionalPerOrder: number): UserWallet {
+    const wallet = this.getOrCreateWallet(telegramId);
+    wallet.maxNotionalPerOrder = maxNotionalPerOrder;
+    this.saveWallets();
+    return wallet;
+  }
+
   /**
    * 清除全部跟单目标
    */
@@ -1028,46 +1204,125 @@ export class WalletService {
     return this.importWallet(telegramId, privateKeyHex, username);
   }
 
+  private classifyStableDenom(denom: string): 'USDT' | 'USDC' | null {
+    const d = denom.toLowerCase();
+    // 主网常见 Peggy USDT 与 Noble/IBC USDC denom 识别
+    if (
+      d.includes('usdt') ||
+      d === 'peggy0xdac17f958d2ee523a2206206994597c13d831ec7'
+    ) {
+      return 'USDT';
+    }
+    if (
+      d.includes('usdc') ||
+      d === 'peggy0x87ab3b4c8661e07d6372361211b96ed4dc36b1b5' ||
+      d === 'peggy0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48' ||
+      d === 'ibc/2cbc2ea121ae42563b08028466f37b600f2d7d4282342de938283cc3fb2bc00e'
+    ) {
+      return 'USDC';
+    }
+    return null;
+  }
+
   /**
-   * 实时查询链上真实余额 (INJ 与 USDT/USDC)
+   * 实时查询链上真实余额 (按 INJ / USDT / USDC 与精确 denom 分离统计)
    */
-  public async getRealBalances(address: string): Promise<{ inj: string; usdt: string; totalUsd: number }> {
+  public async getRealBalances(
+    address: string,
+    injPriceUsd: number = 3.95
+  ): Promise<{
+    inj: string;
+    usdt: string;
+    usdc: string;
+    stableUsd: string;
+    totalUsd: number;
+    denomTotals: Record<string, number>;
+    subaccountDenomTotals: Record<string, number>;
+  }> {
     try {
       const portfolio = await this.portfolioApi.fetchAccountPortfolioBalances(address);
       let injAmount = new BigNumber(0);
       let usdtAmount = new BigNumber(0);
+      let usdcAmount = new BigNumber(0);
+      const denomTotals: Record<string, number> = {};
+      const subaccountDenomTotals: Record<string, number> = {};
+
+      const addDenomBalance = (
+        map: Record<string, number>,
+        denom: string,
+        rawAmount: string,
+        decimals: number
+      ) => {
+        const val = new BigNumber(rawAmount || '0').dividedBy(10 ** decimals).toNumber();
+        if (val > 0) {
+          map[denom] = (map[denom] || 0) + val;
+        }
+      };
 
       if (portfolio && portfolio.bankBalancesList) {
         for (const item of portfolio.bankBalancesList) {
           if (item.denom === 'inj') {
             injAmount = injAmount.plus(new BigNumber(item.amount).dividedBy(1e18));
-          } else if (item.denom.toLowerCase().includes('usdt') || item.denom.toLowerCase().includes('usdc') || item.denom.includes('peggy0x87aB3B4C8661e07D6372361211B96ed4Dc36B1B5')) {
-            usdtAmount = usdtAmount.plus(new BigNumber(item.amount).dividedBy(1e6));
+            addDenomBalance(denomTotals, item.denom, item.amount, 18);
+          } else {
+            const stable = this.classifyStableDenom(item.denom);
+            if (stable === 'USDT') {
+              usdtAmount = usdtAmount.plus(new BigNumber(item.amount).dividedBy(1e6));
+            } else if (stable === 'USDC') {
+              usdcAmount = usdcAmount.plus(new BigNumber(item.amount).dividedBy(1e6));
+            }
+            if (stable) {
+              addDenomBalance(denomTotals, item.denom, item.amount, 6);
+            }
           }
         }
       }
 
-      // 计算子账户内部的保证金余额
       if (portfolio && portfolio.subaccountsList) {
         for (const sub of portfolio.subaccountsList) {
           const avail = sub.deposit?.availableBalance || '0';
           if (sub.denom === 'inj') {
             injAmount = injAmount.plus(new BigNumber(avail).dividedBy(1e18));
-          } else if (sub.denom.toLowerCase().includes('usdt') || sub.denom.toLowerCase().includes('usdc')) {
-            usdtAmount = usdtAmount.plus(new BigNumber(avail).dividedBy(1e6));
+            addDenomBalance(denomTotals, sub.denom, avail, 18);
+            addDenomBalance(subaccountDenomTotals, sub.denom, avail, 18);
+          } else {
+            const stable = this.classifyStableDenom(sub.denom);
+            if (stable === 'USDT') {
+              usdtAmount = usdtAmount.plus(new BigNumber(avail).dividedBy(1e6));
+            } else if (stable === 'USDC') {
+              usdcAmount = usdcAmount.plus(new BigNumber(avail).dividedBy(1e6));
+            }
+            if (stable) {
+              addDenomBalance(denomTotals, sub.denom, avail, 6);
+              addDenomBalance(subaccountDenomTotals, sub.denom, avail, 6);
+            }
           }
         }
       }
 
-      const totalUsd = usdtAmount.plus(injAmount.multipliedBy(3.95)).toNumber();
+      const stableTotal = usdtAmount.plus(usdcAmount);
+      const effectiveInjPrice = injPriceUsd > 0 ? injPriceUsd : 3.95;
+      const totalUsd = stableTotal.plus(injAmount.multipliedBy(effectiveInjPrice)).toNumber();
 
       return {
         inj: injAmount.toFixed(4),
         usdt: usdtAmount.toFixed(2),
+        usdc: usdcAmount.toFixed(2),
+        stableUsd: stableTotal.toFixed(2),
         totalUsd: Number(totalUsd.toFixed(2)),
+        denomTotals,
+        subaccountDenomTotals,
       };
-    } catch (e: any) {
-      return { inj: '0.0000', usdt: '0.00', totalUsd: 0 };
+    } catch {
+      return {
+        inj: '0.0000',
+        usdt: '0.00',
+        usdc: '0.00',
+        stableUsd: '0.00',
+        totalUsd: 0,
+        denomTotals: {},
+        subaccountDenomTotals: {},
+      };
     }
   }
 
@@ -1080,7 +1335,6 @@ export class WalletService {
     }
     const userWallet = this.getOrCreateWallet(userId);
     if (userWallet.referrerId) {
-      // 已经绑定过邀请人，不可重复绑定
       return false;
     }
     userWallet.referrerId = referrerId;
@@ -1090,7 +1344,7 @@ export class WalletService {
   }
 
   /**
-   * 记录跟单成交产生的推广返佣收益并自动累加至邀请人账本
+   * 记录真实跟单成交产生的推广返佣收益并自动累加至邀请人账本
    */
   public recordReferralReward(
     traderUserId: number,
@@ -1104,9 +1358,7 @@ export class WalletService {
     const referrerId = traderWallet.referrerId;
     const referrerWallet = this.getOrCreateWallet(referrerId);
 
-    // Injective 衍生品基础 Taker 费率约 0.1% (0.001)
     const takerFeeUsdt = tradeNotionalUsdt * 0.001;
-    // 邀请人返佣比例 (默认 25%)
     const commissionRate = (this.config.referralRewardPercent || 25) / 100;
     const rewardUsdt = Number((takerFeeUsdt * commissionRate).toFixed(4));
 
@@ -1139,6 +1391,7 @@ export class WalletService {
     const withdrawn = wallet.referralWithdrawnUsdt || 0;
     const available = Math.max(0, Number((totalEarnings - withdrawn).toFixed(4)));
     const volume = wallet.referralVolumeUsdt || 0;
+    const pendingPayouts = (wallet.referralPayouts || []).filter((p) => p.status === 'PENDING_PAYOUT');
 
     return {
       invitedCount: invitedUsers.length,
@@ -1151,15 +1404,25 @@ export class WalletService {
       withdrawn,
       available,
       volume,
+      pendingPayoutUsdt: Number(
+        pendingPayouts.reduce((s, p) => s + p.amountUsdt, 0).toFixed(4)
+      ),
+      payouts: wallet.referralPayouts || [],
     };
   }
 
   /**
-   * 用户申请提现已累积的推广返佣 (满 1.00 USDT 即可结算划转)
+   * 用户申请提现已累积的推广返佣 (满 1.00 USDT 创建可审计链上打款申请单，杜绝静默空扣)
    */
   public withdrawReferralRewards(
     userId: number
-  ): { success: boolean; amount: number; message: string; wallet: UserWallet } {
+  ): {
+    success: boolean;
+    amount: number;
+    payoutId?: string;
+    message: string;
+    wallet: UserWallet;
+  } {
     const wallet = this.getOrCreateWallet(userId);
     const stats = this.getReferralStats(userId);
 
@@ -1177,19 +1440,121 @@ export class WalletService {
       ((wallet.referralWithdrawnUsdt || 0) + withdrawAmount).toFixed(4)
     );
 
-    // 提现收益可直接注入用户体验金余额中，或作为可提现记录
-    if (wallet.practiceMode) {
-      wallet.practiceBalanceUsdt = Number(
-        ((wallet.practiceBalanceUsdt || 10000) + withdrawAmount).toFixed(2)
-      );
+    if (!Array.isArray(wallet.referralPayouts)) {
+      wallet.referralPayouts = [];
+    }
+    const payoutId = `PAY_${Date.now()}_${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
+    wallet.referralPayouts.unshift({
+      id: payoutId,
+      amountUsdt: withdrawAmount,
+      toAddress: wallet.injectiveAddress,
+      status: 'PENDING_PAYOUT',
+      createdAt: Date.now(),
+    });
+    if (wallet.referralPayouts.length > 50) {
+      wallet.referralPayouts = wallet.referralPayouts.slice(0, 50);
     }
 
     this.saveWallets();
     return {
       success: true,
       amount: withdrawAmount,
-      message: `🎉 成功提取 $${withdrawAmount.toFixed(2)} USDT 返佣奖励！`,
+      payoutId,
+      message: `已登记 $${withdrawAmount.toFixed(2)} USDT 返佣提现单 (${payoutId})，目标地址: ${wallet.injectiveAddress}`,
       wallet,
     };
+  }
+
+  public markReferralPayoutPaid(userId: number, payoutId: string, txHash: string) {
+    const wallet = this.wallets.get(userId);
+    if (!wallet || !Array.isArray(wallet.referralPayouts)) return;
+    const rec = wallet.referralPayouts.find((p) => p.id === payoutId);
+    if (rec) {
+      rec.status = 'PAID';
+      rec.txHash = txHash;
+      this.saveWallets();
+    }
+  }
+
+  /**
+   * 实盘多巨鲸仓位归属冲突检查：防止巨鲸 B 的反向信号误平掉巨鲸 A 的在途实盘持仓
+   */
+  public checkRealPositionConflict(
+    userId: number,
+    marketId: string,
+    incomingDirection: 'BUY' | 'SELL',
+    traderAddress?: string
+  ): { conflict: boolean; ownerAddresses: string[] } {
+    if (!traderAddress) return { conflict: false, ownerAddresses: [] };
+    const wallet = this.wallets.get(userId);
+    const owner = wallet?.realPositionOwners?.[marketId];
+    if (!owner || owner.direction === incomingDirection || owner.traderAddresses.length === 0) {
+      return { conflict: false, ownerAddresses: [] };
+    }
+    const cleanTrader = traderAddress.toLowerCase();
+    const isSameOwner = owner.traderAddresses.some((a) => a.toLowerCase() === cleanTrader);
+    if (isSameOwner) {
+      return { conflict: false, ownerAddresses: owner.traderAddresses };
+    }
+    return { conflict: true, ownerAddresses: owner.traderAddresses };
+  }
+
+  public updateRealPositionOwner(
+    userId: number,
+    marketId: string,
+    direction: 'BUY' | 'SELL',
+    traderAddress?: string,
+    isReduceOnly: boolean = false,
+    fullyClosed: boolean = false
+  ) {
+    const wallet = this.getOrCreateWallet(userId);
+    if (!wallet.realPositionOwners) {
+      wallet.realPositionOwners = {};
+    }
+    if (fullyClosed) {
+      delete wallet.realPositionOwners[marketId];
+      this.saveWallets();
+      return;
+    }
+    const cleanTrader = (traderAddress || '').toLowerCase();
+    if (isReduceOnly) {
+      const existing = wallet.realPositionOwners[marketId];
+      if (existing && cleanTrader) {
+        existing.traderAddresses = existing.traderAddresses.filter(
+          (a) => a.toLowerCase() !== cleanTrader
+        );
+        if (existing.traderAddresses.length === 0) {
+          delete wallet.realPositionOwners[marketId];
+        } else {
+          existing.updatedAt = Date.now();
+        }
+        this.saveWallets();
+      }
+      return;
+    }
+
+    const cur = wallet.realPositionOwners[marketId];
+    if (!cur || cur.direction !== direction) {
+      wallet.realPositionOwners[marketId] = {
+        direction,
+        traderAddresses: cleanTrader ? [cleanTrader] : [],
+        updatedAt: Date.now(),
+      };
+    } else if (cleanTrader && !cur.traderAddresses.includes(cleanTrader)) {
+      cur.traderAddresses.push(cleanTrader);
+      cur.updatedAt = Date.now();
+    }
+    this.saveWallets();
+  }
+
+  public clearRealPositionOwners(userId: number, marketId?: string) {
+    const wallet = this.wallets.get(userId);
+    if (!wallet || !wallet.realPositionOwners) return;
+    if (marketId) {
+      delete wallet.realPositionOwners[marketId];
+    } else {
+      wallet.realPositionOwners = {};
+    }
+    this.saveWallets();
   }
 }

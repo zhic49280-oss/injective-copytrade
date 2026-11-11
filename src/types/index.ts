@@ -11,11 +11,24 @@ export interface MarketInfo {
   ticker: string;
   oracleBase: string;
   oracleQuote: string;
+  quoteDenom: string;
   quoteTokenDecimals: number;
   minPriceTickSize: number;
   minQuantityTickSize: number;
+  minNotional: number;
+  initialMarginRatio: number;
+  maintenanceMarginRatio: number;
   makerFeeRate: string;
   takerFeeRate: string;
+}
+
+export interface UserRiskConfig {
+  copyMode?: CopyMode;
+  fixedUsdtAmount?: number;
+  copyRatio?: number;
+  maxSlippagePercent?: number;
+  maxNotionalPerOrder?: number;
+  maxLeverage?: number;
 }
 
 /**
@@ -46,6 +59,7 @@ export interface RiskCheckInput {
   currentMidPrice: number;
   currentAsk?: number;
   currentBid?: number;
+  userRiskConfig?: UserRiskConfig;
 }
 
 export interface RiskCheckResult {
@@ -67,10 +81,15 @@ export interface CopyOrderResult {
   success: boolean;
   sourceEventId: string;
   txHash?: string;
+  marketId?: string;
   marketTicker: string;
   direction: TradeDirection;
   executedQuantity: number;
   executionPrice: number;
+  protectionPrice?: number;
+  currentMidPrice?: number;
+  currentAsk?: number;
+  currentBid?: number;
   margin: number;
   leverage: number;
   executionTimeMs: number;

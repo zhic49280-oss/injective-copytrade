@@ -79,23 +79,29 @@ export class CopyEngine {
       currentBid,
     });
 
-    if (!riskResult.passed) {
-      console.warn(`[CopyEngine] 🛑 风控拦截: ${riskResult.reason}`);
-      return {
-        success: false,
-        sourceEventId: event.id,
-        marketTicker: event.marketTicker,
-        direction: event.direction,
-        executedQuantity: 0,
-        executionPrice: 0,
-        margin: 0,
-        leverage: riskResult.leverage,
-        executionTimeMs: Date.now() - startTime,
-        error: riskResult.reason,
-      };
-    }
-
     const realFillPrice = riskResult.fillPrice || riskResult.adjustedPrice;
+    const baseResult: CopyOrderResult = {
+      success: riskResult.passed,
+      sourceEventId: event.id,
+      marketId: event.marketId,
+      marketTicker: event.marketTicker,
+      direction: event.direction,
+      executedQuantity: riskResult.adjustedQuantity,
+      executionPrice: realFillPrice || currentMidPrice || event.price,
+      protectionPrice: riskResult.adjustedPrice,
+      currentMidPrice,
+      currentAsk,
+      currentBid,
+      margin: riskResult.calculatedMargin,
+      leverage: riskResult.leverage,
+      executionTimeMs: Date.now() - startTime,
+      error: riskResult.passed ? undefined : riskResult.reason,
+    };
+
+    if (!riskResult.passed) {
+      console.warn(`[CopyEngine] 🛑 全局基准风控拦截: ${riskResult.reason}`);
+      return baseResult;
+    }
 
     console.log(`[CopyEngine] ✅ 风控审查通过:`);
     console.log(`  - 跟单方向: ${event.direction}`);
@@ -105,8 +111,15 @@ export class CopyEngine {
     console.log(`  - 所需保证金: $${riskResult.calculatedMargin} (${riskResult.leverage}x 杠杆)`);
     console.log(`  - 运行模式: ${this.config.dryRun ? '🧪 DRY_RUN (模拟)' : '🔴 LIVE (真实上链)'}`);
 
-    // 4. 提交订单 (若未配置全局 followerAddress 且处于多用户独立钱包模式，则返回风控基准参数交由下游按各用户独立钱包执行)
-    if (!this.injectiveService.followerAddress && !this.config.dryRun) {
+    // 4. 多用户独立钱包模式或 TG 模式下跳过非目标的全局私钥下单，交由下游按各用户独立钱包与风控参数执行
+    const hasGlobalFollower = Boolean(this.injectiveService.followerAddress);
+    const isGlobalTarget =
+      !this.config.telegramBotToken ||
+      process.env.GLOBAL_FOLLOWER_COPY_ALL === 'true' ||
+      (this.config.targetTraderAddress &&
+        event.traderAddress.toLowerCase() === this.config.targetTraderAddress.toLowerCase());
+
+    if ((!hasGlobalFollower || !isGlobalTarget) && !this.config.dryRun) {
       const latency = Date.now() - startTime;
       this.successfulOrdersCount++;
 
@@ -118,15 +131,9 @@ export class CopyEngine {
       console.log(`=========================================================\n`);
 
       return {
+        ...baseResult,
         success: true,
-        sourceEventId: event.id,
         txHash: undefined,
-        marketTicker: event.marketTicker,
-        direction: event.direction,
-        executedQuantity: riskResult.adjustedQuantity,
-        executionPrice: realFillPrice,
-        margin: riskResult.calculatedMargin,
-        leverage: riskResult.leverage,
         executionTimeMs: latency,
       };
     }
@@ -137,6 +144,7 @@ export class CopyEngine {
         direction: event.direction,
         quantity: riskResult.adjustedQuantity,
         price: riskResult.adjustedPrice,
+        fillPrice: realFillPrice,
         leverage: riskResult.leverage,
       });
 
@@ -152,15 +160,9 @@ export class CopyEngine {
       console.log(`=========================================================\n`);
 
       return {
+        ...baseResult,
         success: true,
-        sourceEventId: event.id,
         txHash: orderResp.txHash,
-        marketTicker: event.marketTicker,
-        direction: event.direction,
-        executedQuantity: riskResult.adjustedQuantity,
-        executionPrice: realFillPrice,
-        margin: riskResult.calculatedMargin,
-        leverage: riskResult.leverage,
         executionTimeMs: latency,
       };
     } catch (err: any) {
@@ -168,18 +170,16 @@ export class CopyEngine {
       console.error(`[CopyEngine] ❌ 订单广播执行失败:`, err.message || err);
 
       return {
+        ...baseResult,
         success: false,
-        sourceEventId: event.id,
-        marketTicker: event.marketTicker,
-        direction: event.direction,
-        executedQuantity: riskResult.adjustedQuantity,
-        executionPrice: realFillPrice,
-        margin: riskResult.calculatedMargin,
-        leverage: riskResult.leverage,
         executionTimeMs: latency,
         error: err.message || String(err),
       };
     }
+  }
+
+  public getRiskManager(): RiskManager {
+    return this.riskManager;
   }
 
   public getInjectiveService(): InjectiveService {

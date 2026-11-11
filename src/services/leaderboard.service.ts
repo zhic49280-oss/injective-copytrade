@@ -14,6 +14,21 @@ export const KNOWN_MARKET_MAKERS = new Set<string>([
   'inj1ntzp6egl4z6e7gfmvsc63mh8ee5h4m2xqhn3lk', // 0xn3lk - 92% Maker 挂单/微量碎单刷量做市商
 ]);
 
+export function parseSubaccountIndex(subaccountId?: string): number {
+  if (!subaccountId || subaccountId.length < 24) return 0;
+  const suffix = subaccountId.slice(-24);
+  const parsed = parseInt(suffix, 16);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function formatWhalePrice(price: number): string {
+  if (!price || isNaN(price)) return '0';
+  if (price >= 100) return price.toFixed(2);
+  if (price >= 1) return price.toFixed(4);
+  if (price >= 0.001) return price.toFixed(6);
+  return Number(price.toPrecision(6)).toString();
+}
+
 /**
  * 深度智能评估一个链上地址是否为做市商或高频套利机器人
  */
@@ -22,6 +37,7 @@ export function isMarketMakerOrHftBot(params: {
   trades: any[];
   totalNotionalUsd?: number;
   openPosCount?: number;
+  marketDecimalsMap?: Map<string, number>;
 }): { isMarketMaker: boolean; reason?: string } {
   const addrLower = params.address.toLowerCase();
   if (KNOWN_MARKET_MAKERS.has(addrLower)) {
@@ -40,17 +56,27 @@ export function isMarketMakerOrHftBot(params: {
   let makerCount = 0;
   let totalNotional = 0;
   let recent1hTrades = 0;
+  let microUnder5Count = 0;
+  let microUnder10Count = 0;
   const marketTradeCounts = new Map<string, number>();
+  const lastMarketTrade = new Map<string, { ts: number; direction: string }>();
   let sameMarketRapidFlips = 0;
+
+  // 按 orderHash 聚合成交（同一笔大单被订单簿拆成多个 fill 不应误判为 TWAP 机器人）
+  const orderBuckets = new Map<string, { marketId: string; ts: number; notional: number; direction: string }>();
 
   for (let i = 0; i < trades.length; i++) {
     const t = trades[i];
     const isMaker = (t.executionSide || '').toLowerCase() === 'maker';
     if (isMaker) makerCount += 1;
 
-    const p = parseFloat(t.executionPrice || '0') / 1e6;
+    const decimals = params.marketDecimalsMap?.get(t.marketId) ?? 6;
+    const p = parseFloat(t.executionPrice || '0') / 10 ** decimals;
     const q = parseFloat(t.executionQuantity || '0');
-    totalNotional += p * q;
+    const notional = p * q;
+    totalNotional += notional;
+    if (notional > 0 && notional < 5) microUnder5Count += 1;
+    if (notional > 0 && notional < 10) microUnder10Count += 1;
 
     const rawTs = Number(t.executedAt || 0);
     const ts = rawTs > 0 && rawTs < 1e12 ? rawTs * 1000 : rawTs;
@@ -61,16 +87,22 @@ export function isMarketMakerOrHftBot(params: {
     const mid = t.marketId || 'unknown';
     marketTradeCounts.set(mid, (marketTradeCounts.get(mid) || 0) + 1);
 
-    // 检测同一标的 5 分钟内快速反手 (买卖反向)
-    if (i < trades.length - 1) {
-      const nextT = trades[i + 1];
-      if (t.marketId === nextT.marketId && t.tradeDirection !== nextT.tradeDirection) {
-        const nextTs = Number(nextT.executedAt || 0);
-        const actualNextTs = nextTs > 0 && nextTs < 1e12 ? nextTs * 1000 : nextTs;
-        if (Math.abs(ts - actualNextTs) <= 300_000) {
-          sameMarketRapidFlips += 1;
-        }
+    const dir = (t.tradeDirection || '').toLowerCase();
+    const orderKey = t.orderHash || `${mid}_${Math.floor(ts / 3000)}_${dir}`;
+    const bucket = orderBuckets.get(orderKey) || { marketId: mid, ts, notional: 0, direction: dir };
+    bucket.notional += notional;
+    bucket.ts = Math.max(bucket.ts, ts);
+    orderBuckets.set(orderKey, bucket);
+
+    // 检测同一标的 5 分钟内快速反手 (支持多品种穿插下单的跨标的识别)
+    const prevSameMarket = lastMarketTrade.get(mid);
+    if (prevSameMarket && dir && prevSameMarket.direction && prevSameMarket.direction !== dir) {
+      if (Math.abs(ts - prevSameMarket.ts) <= 300_000) {
+        sameMarketRapidFlips += 1;
       }
+    }
+    if (dir) {
+      lastMarketTrade.set(mid, { ts, direction: dir });
     }
   }
 
@@ -87,8 +119,8 @@ export function isMarketMakerOrHftBot(params: {
     };
   }
 
-  // 2. 极端高频且单标的高集中度 (如 1 小时内单标的成交超过 15 笔)
-  if (recent1hTrades >= 15 && singleMarketConcentration >= 0.7) {
+  // 2. 极端高频且单标的高集中度 (如 1 小时内单标的独立订单超过 15 笔)
+  if (recent1hTrades >= 15 && singleMarketConcentration >= 0.7 && orderBuckets.size >= 10) {
     return {
       isMarketMaker: true,
       reason: `近1小时集中在单标的交易 ${recent1hTrades} 笔，属于高频套利吃单机器人`,
@@ -100,6 +132,47 @@ export function isMarketMakerOrHftBot(params: {
     return {
       isMarketMaker: true,
       reason: `被动挂单 (Maker) 占比达 ${(makerRatio * 100).toFixed(0)}% 且单笔均额极小 ($${avgNotional.toFixed(1)})，属于做市商`,
+    };
+  }
+
+  // 4. TWAP / 定投拆单机器人检测：同一标的连续 >= 5 笔独立小额订单 (< $400) 且金额高度一致 (最大/最小 <= 1.35)
+  const ordersByMarket = new Map<string, Array<{ ts: number; notional: number; direction: string }>>();
+  for (const ord of orderBuckets.values()) {
+    if (ord.notional <= 0) continue;
+    const arr = ordersByMarket.get(ord.marketId) || [];
+    arr.push(ord);
+    ordersByMarket.set(ord.marketId, arr);
+  }
+  for (const [, ordList] of ordersByMarket.entries()) {
+    if (ordList.length >= 5) {
+      const sorted = [...ordList].sort((a, b) => b.ts - a.ts).slice(0, 8);
+      const notionals = sorted.map((o) => o.notional);
+      const maxN = Math.max(...notionals);
+      const minN = Math.min(...notionals);
+      const avgN = notionals.reduce((s, n) => s + n, 0) / notionals.length;
+      const spanMs = sorted[0].ts - sorted[sorted.length - 1].ts;
+      if (avgN < 400 && minN > 0 && maxN / minN <= 1.35 && spanMs <= 4 * 3600_000) {
+        return {
+          isMarketMaker: true,
+          reason: `检测到同标的连续 ${sorted.length} 笔高度相似小额订单 (均额 $${avgN.toFixed(1)})，属于 TWAP/定投拆单机器人`,
+        };
+      }
+    }
+  }
+
+  // 5. 高比例 $1~$5 碎单刷量机器人 (哪怕 0% Maker 也会让跟单者触发风控/无效磨损)
+  if (trades.length >= 10 && microUnder5Count / trades.length >= 0.5) {
+    return {
+      isMarketMaker: true,
+      reason: `近 ${trades.length} 笔成交中 ${Math.round((microUnder5Count / trades.length) * 100)}% 为不足 $5 的微额碎单，属于高频刷量机器人`,
+    };
+  }
+
+  // 6. 超多品种并发微额铺网机器人 (同时持有 > 100 个仓位且伴随大量 < $10 碎单)
+  if ((params.openPosCount || 0) > 100 && trades.length >= 10 && microUnder10Count / trades.length >= 0.2) {
+    return {
+      isMarketMaker: true,
+      reason: `同时持有 ${params.openPosCount} 个跨市场仓位且高频夹杂微额碎单，属于多市场铺网做市机器人`,
     };
   }
 
@@ -116,6 +189,7 @@ export interface WhaleProfile {
   badge: string;
   address: string;
   subaccountIndex: number;
+  subaccountId?: string;
   winRatePercent: number;       // 真实盈利持仓/平仓胜率
   monthlyPnlUsd: number;        // 真实当前持仓浮盈 + 已实现盈亏 (USD)
   unrealizedPnlUsd: number;     // 真实链上当前持仓总浮盈 (USD)
@@ -143,8 +217,13 @@ export class LeaderboardService {
   private whales: WhaleProfile[] = [];
   private isRefreshing: boolean = false;
   private lastRefreshTime: number = 0;
+  private marketDecimalsMap: Map<string, number> = new Map();
 
-  constructor(endpoints?: { indexer: string }, networkName: 'mainnet' | 'testnet' = 'testnet') {
+  constructor(
+    endpoints?: { indexer: string },
+    networkName: 'mainnet' | 'testnet' = 'testnet',
+    marketDecimalsMap?: Map<string, number>
+  ) {
     this.networkName = networkName;
     const defaultEndpoints = getNetworkEndpoints(
       networkName === 'mainnet' ? Network.MainnetSentry : Network.TestnetSentry
@@ -155,7 +234,26 @@ export class LeaderboardService {
     this.mainnetApi = new IndexerGrpcDerivativesApi(
       getNetworkEndpoints(Network.MainnetSentry).indexer
     );
+    if (marketDecimalsMap) {
+      this.marketDecimalsMap = marketDecimalsMap;
+    }
     this.whales = [];
+  }
+
+  public setMarketDecimalsMap(map: Map<string, number>) {
+    this.marketDecimalsMap = map;
+  }
+
+  private async ensureMarketDecimals() {
+    if (this.marketDecimalsMap.size > 0) return;
+    try {
+      const markets = await this.mainnetApi.fetchMarkets({ marketStatus: 'active' });
+      for (const m of markets) {
+        this.marketDecimalsMap.set(m.marketId, m.quoteToken?.decimals ?? 6);
+      }
+    } catch {
+      // fallback to 6
+    }
   }
 
   public getLastRefreshTime(): number {
@@ -187,25 +285,37 @@ export class LeaderboardService {
     this.isRefreshing = true;
 
     try {
-      // 1. 并发扫描主网前 1,000 个活跃实盘持仓 (10 页并发，耗时 ~1.5 秒)
-      const offsets = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900];
-      const posPages = await Promise.all(
-        offsets.map((skip) =>
-          this.mainnetApi
-            .fetchPositionsV2({ pagination: { limit: 100, skip } })
-            .then((r) => r.positions || [])
-            .catch(() => [] as any[])
-        )
-      );
+      await this.ensureMarketDecimals();
 
-      const allPositions = posPages.flat();
+      // 1. 并发全量扫描主网活跃实盘持仓 (不再截断前 1,000 条，完整扫完 2,000+ 真实仓位)
+      const allPositions: any[] = [];
+      for (let baseSkip = 0; baseSkip < 5000; baseSkip += 1000) {
+        const batchOffsets = Array.from({ length: 10 }, (_, idx) => baseSkip + idx * 100);
+        const batchPages = await Promise.all(
+          batchOffsets.map((skip) =>
+            this.mainnetApi
+              .fetchPositionsV2({ pagination: { limit: 100, skip } })
+              .then((r) => r.positions || [])
+              .catch(() => [] as any[])
+          )
+        );
+        let reachedEnd = false;
+        for (const page of batchPages) {
+          allPositions.push(...page);
+          if (page.length < 100) {
+            reachedEnd = true;
+          }
+        }
+        if (reachedEnd) break;
+      }
 
-      // 按交易员地址聚合所有链上真实持仓
+      // 按子账户 (subaccountId) 聚合所有链上真实持仓，保留真实子账户索引
       const whaleMap = new Map<
         string,
         {
           address: string;
           subaccountId: string;
+          subaccountIndex: number;
           openPosCount: number;
           winPosCount: number;
           totalNotionalUsd: number;
@@ -236,10 +346,12 @@ export class LeaderboardService {
           continue;
         }
 
+        const decimals = this.marketDecimalsMap.get(pos.marketId) ?? 6;
+        const divisor = 10 ** decimals;
         const qty = parseFloat(pos.quantity || '0');
-        const entryPrice = parseFloat(pos.entryPrice || '0') / 1e6;
-        const markPrice = parseFloat(pos.markPrice || '0') / 1e6;
-        const marginUsd = Math.max(0, parseFloat(pos.margin || '0') / 1e6);
+        const entryPrice = parseFloat(pos.entryPrice || '0') / divisor;
+        const markPrice = parseFloat(pos.markPrice || '0') / divisor;
+        const marginUsd = Math.max(0, parseFloat(pos.margin || '0') / divisor);
         if (qty <= 0 || markPrice <= 0) continue;
 
         const notionalUsd = qty * markPrice;
@@ -249,9 +361,11 @@ export class LeaderboardService {
           : (entryPrice - markPrice) * qty;
         const posRoiPct = marginUsd > 0 ? (upnlUsd / marginUsd) * 100 : 0;
 
-        const cur = whaleMap.get(addr) || {
+        const subKey = pos.subaccountId.toLowerCase();
+        const cur = whaleMap.get(subKey) || {
           address: addr,
           subaccountId: pos.subaccountId,
+          subaccountIndex: parseSubaccountIndex(pos.subaccountId),
           openPosCount: 0,
           winPosCount: 0,
           totalNotionalUsd: 0,
@@ -284,21 +398,21 @@ export class LeaderboardService {
           };
         }
 
-        whaleMap.set(addr, cur);
+        whaleMap.set(subKey, cur);
       }
 
-      // 筛选出真正高浮盈且有实盘规模的链上巨鲸，排除总仓位很多但平均单仓极小的散户刷单机器人
+      // 筛选出正浮盈且具备实盘规模的链上子账户，扩大候选池到 60 名，避免做市商/死仓挤占名额
       const topCandidates = Array.from(whaleMap.values())
         .filter((w) => {
           const avgPosSize = w.openPosCount > 0 ? w.totalNotionalUsd / w.openPosCount : 0;
           return (
-            w.totalUnrealizedPnlUsd > 50 &&
+            w.totalUnrealizedPnlUsd > 0 &&
             w.totalNotionalUsd >= 500 &&
             (w.openPosCount <= 20 || avgPosSize >= 200 || w.totalNotionalUsd >= 50000)
           );
         })
         .sort((a, b) => b.totalUnrealizedPnlUsd - a.totalUnrealizedPnlUsd)
-        .slice(0, 25);
+        .slice(0, 60);
 
       // 2. 并发查询候选巨鲸子账户的最新交易记录 (limit: 50)
       const tradeDetails = await Promise.all(
@@ -326,20 +440,12 @@ export class LeaderboardService {
         const cand = topCandidates[i];
         const trades = tradeDetails[i] || [];
         let lastTradeTimestamp = 0;
-        let recent1hTrades = 0;
-        let makerFills = 0;
 
         for (const t of trades) {
           const rawTs = Number(t.executedAt || 0);
           const ts = rawTs > 0 && rawTs < 1e12 ? rawTs * 1000 : rawTs;
           if (ts > lastTradeTimestamp) {
             lastTradeTimestamp = ts;
-          }
-          if (ts > 0 && now - ts <= 3600_000) {
-            recent1hTrades += 1;
-          }
-          if ((t.executionSide || '').toLowerCase() === 'maker') {
-            makerFills += 1;
           }
         }
         const lastTradeMinutesAgo =
@@ -352,6 +458,7 @@ export class LeaderboardService {
           trades,
           totalNotionalUsd: cand.totalNotionalUsd,
           openPosCount: cand.openPosCount,
+          marketDecimalsMap: this.marketDecimalsMap,
         });
         const isHftOrMakerBot = mmEval.isMarketMaker;
 
@@ -364,25 +471,37 @@ export class LeaderboardService {
         });
       }
 
-      // 严格剔除所有做市商与高频刷量机器人，绝对禁止做市商混入榜单供用户跟单
-      const directionalCandidates = evaluatedCandidates.filter((item) => !item.isHftOrMakerBot);
-      const pool = directionalCandidates;
+      // 严格剔除做市商/高频刷量机器人 与 >14 天的僵尸死仓，并按主地址去重 (保留浮盈最高的活跃子账户)
+      const maxStaleMinutes = 14 * 1440;
+      const dedupByAddress = new Map<string, (typeof evaluatedCandidates)[0]>();
+      for (const item of evaluatedCandidates) {
+        if (item.isHftOrMakerBot) continue;
+        if (item.lastTradeMinutesAgo > maxStaleMinutes) continue;
+        const addrKey = item.cand.address.toLowerCase();
+        const existing = dedupByAddress.get(addrKey);
+        if (
+          !existing ||
+          item.cand.totalUnrealizedPnlUsd > existing.cand.totalUnrealizedPnlUsd
+        ) {
+          dedupByAddress.set(addrKey, item);
+        }
+      }
+      const pool = Array.from(dedupByAddress.values());
 
-      // 严格剔除 7 天以上的僵尸死仓：优先筛选 24 小时内 (lastTradeMinutesAgo <= 1440) 的活跃盈利巨鲸
+      // 按活跃时效分档排序：优先 24 小时内，其次 7 天内，最多放宽到 14 天内 (绝不塞入几十天前的死仓)
       const active24h = pool
         .filter((item) => item.lastTradeMinutesAgo <= 1440)
         .sort((a, b) => b.cand.totalUnrealizedPnlUsd - a.cand.totalUnrealizedPnlUsd);
 
-      const fallbackRecent = pool
+      const active7d = pool
         .filter((item) => item.lastTradeMinutesAgo > 1440 && item.lastTradeMinutesAgo <= 10080)
+        .sort((a, b) => b.cand.totalUnrealizedPnlUsd - a.cand.totalUnrealizedPnlUsd);
+
+      const active14d = pool
+        .filter((item) => item.lastTradeMinutesAgo > 10080 && item.lastTradeMinutesAgo <= maxStaleMinutes)
         .sort((a, b) => a.lastTradeMinutesAgo - b.lastTradeMinutesAgo);
 
-      // 若近期活跃巨鲸不足 5 名，再从更长周期的候选人中补充，但优先保证近期活跃
-      const emergencyFallback = pool
-        .filter((item) => item.lastTradeMinutesAgo > 10080)
-        .sort((a, b) => a.lastTradeMinutesAgo - b.lastTradeMinutesAgo);
-
-      const selectedTop5 = [...active24h, ...fallbackRecent, ...emergencyFallback].slice(0, 5);
+      const selectedTop5 = [...active24h, ...active7d, ...active14d].slice(0, 5);
       const finalWhales: WhaleProfile[] = [];
 
       for (let i = 0; i < selectedTop5.length; i++) {
@@ -393,7 +512,8 @@ export class LeaderboardService {
         let winningCloseCount = 0;
 
         for (const t of trades) {
-          const pnl = parseFloat(t.pnl || '0') / 1e6;
+          const decimals = this.marketDecimalsMap.get(t.marketId) ?? 6;
+          const pnl = parseFloat(t.pnl || '0') / 10 ** decimals;
           realizedPnlUsd += pnl;
           if (pnl !== 0) {
             closingCount += 1;
@@ -411,7 +531,7 @@ export class LeaderboardService {
 
         const best = item.bestPosition;
         const bestDesc = best
-          ? `重仓 ${best.direction} ${best.ticker} (开仓均价 $${best.entryPrice.toFixed(2)} → 现价 $${best.markPrice.toFixed(2)}, 单笔浮盈 +$${Math.round(best.upnlUsd).toLocaleString()})`
+          ? `重仓 ${best.direction} ${best.ticker} (开仓均价 $${formatWhalePrice(best.entryPrice)} → 现价 $${formatWhalePrice(best.markPrice)}, 单笔浮盈 +$${Math.round(best.upnlUsd).toLocaleString()})`
           : '多品种组合对冲持仓';
 
         let badge = '🐋 链上实盘巨鲸';
@@ -434,7 +554,8 @@ export class LeaderboardService {
           name: `Injective 巨鲸 0x${item.address.slice(-4)}`,
           badge,
           address: item.address,
-          subaccountIndex: 0,
+          subaccountIndex: item.subaccountIndex,
+          subaccountId: item.subaccountId,
           winRatePercent: winRate,
           monthlyPnlUsd: Math.round(item.totalUnrealizedPnlUsd),
           unrealizedPnlUsd: Math.round(item.totalUnrealizedPnlUsd),

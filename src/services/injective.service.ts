@@ -1,12 +1,12 @@
-import { Network, getNetworkEndpoints } from '@injectivelabs/networks';
+import { getNetworkEndpoints } from '@injectivelabs/networks';
 import {
   IndexerGrpcDerivativesApi,
   IndexerGrpcDerivativesStream,
   MsgBroadcasterWithPk,
   PrivateKey,
   getSubaccountId,
-  getDefaultSubaccountId,
   MsgCreateDerivativeMarketOrder,
+  MsgSend,
   OrderTypeMap,
   derivativePriceToChainPriceToFixed,
   derivativeQuantityToChainQuantityToFixed,
@@ -15,6 +15,21 @@ import {
 import BigNumber from 'bignumber.js';
 import { AppConfig } from '../config/index.js';
 import { MarketInfo, TradeDirection } from '../types/index.js';
+import { RiskManager } from './risk-manager.js';
+
+export interface OnChainPosition {
+  marketId: string;
+  ticker: string;
+  subaccountId: string;
+  direction: 'long' | 'short';
+  quantity: number;
+  entryPrice: number;
+  markPrice: number;
+  liquidationPrice: number;
+  margin: number;
+  unrealizedPnl: number;
+  denom: string;
+}
 
 export class InjectiveService {
   private config: AppConfig;
@@ -27,9 +42,10 @@ export class InjectiveService {
   public followerSubaccountId?: string;
   public targetSubaccountId?: string;
 
-  // 市场缓存
+  // 市场缓存与用户广播器缓存
   private marketCache: Map<string, MarketInfo> = new Map();
   private tickerToMarketId: Map<string, string> = new Map();
+  private userBroadcasters: Map<string, MsgBroadcasterWithPk> = new Map();
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -133,9 +149,13 @@ export class InjectiveService {
         ticker: m.ticker,
         oracleBase: (m as any).oracleBase || '',
         oracleQuote: (m as any).oracleQuote || '',
-        quoteTokenDecimals: m.quoteToken?.decimals || 6,
+        quoteDenom: (m as any).quoteDenom || '',
+        quoteTokenDecimals: m.quoteToken?.decimals ?? 6,
         minPriceTickSize: Number(m.minPriceTickSize || '1000'),
         minQuantityTickSize: Number(m.minQuantityTickSize || '0.001'),
+        minNotional: Number((m as any).minNotional || '0'),
+        initialMarginRatio: Number((m as any).initialMarginRatio || '0.05'),
+        maintenanceMarginRatio: Number((m as any).maintenanceMarginRatio || '0.025'),
         makerFeeRate: m.makerFeeRate || '-0.0001',
         takerFeeRate: m.takerFeeRate || '0.001',
       };
@@ -153,6 +173,60 @@ export class InjectiveService {
   public getMarketByTicker(ticker: string): MarketInfo | undefined {
     const marketId = this.tickerToMarketId.get(ticker.toUpperCase());
     return marketId ? this.marketCache.get(marketId) : undefined;
+  }
+
+  public getMarketDecimalsMap(): Map<string, number> {
+    const map = new Map<string, number>();
+    for (const [id, info] of this.marketCache.entries()) {
+      map.set(id, info.quoteTokenDecimals);
+    }
+    return map;
+  }
+
+  /**
+   * 获取指定子账户的真实链上永续合约持仓
+   */
+  public async getSubaccountPositions(subaccountId: string): Promise<OnChainPosition[]> {
+    const res = await this.derivativesApi.fetchPositionsV2({ subaccountId });
+    const rawList = res?.positions || [];
+    const results: OnChainPosition[] = [];
+
+    for (const pos of rawList) {
+      const market = this.getMarket(pos.marketId);
+      const decimals = market?.quoteTokenDecimals ?? 6;
+      const divisor = 10 ** decimals;
+
+      const quantity = parseFloat(pos.quantity || '0');
+      if (quantity <= 0) continue;
+
+      const entryPrice = parseFloat(pos.entryPrice || '0') / divisor;
+      const markPrice = parseFloat(pos.markPrice || '0') / divisor;
+      const liquidationPrice = parseFloat(pos.liquidationPrice || '0') / divisor;
+      const margin = parseFloat(pos.margin || '0') / divisor;
+      const direction = (pos.direction || '').toLowerCase() === 'short' ? 'short' : 'long';
+      const rawUpnl = pos.upnl !== undefined ? parseFloat(pos.upnl) / divisor : NaN;
+      const unrealizedPnl = Number.isFinite(rawUpnl)
+        ? rawUpnl
+        : direction === 'long'
+        ? (markPrice - entryPrice) * quantity
+        : (entryPrice - markPrice) * quantity;
+
+      results.push({
+        marketId: pos.marketId,
+        ticker: pos.ticker || market?.ticker || pos.marketId,
+        subaccountId: pos.subaccountId,
+        direction,
+        quantity,
+        entryPrice,
+        markPrice,
+        liquidationPrice,
+        margin,
+        unrealizedPnl,
+        denom: pos.denom || market?.quoteDenom || '',
+      });
+    }
+
+    return results;
   }
 
   /**
@@ -197,6 +271,109 @@ export class InjectiveService {
   }
 
   /**
+   * 构造符合 Injective 链上精度与最小步长要求的 MsgCreateDerivativeMarketOrder
+   */
+  public buildDerivativeMarketOrderMsg(params: {
+    injectiveAddress: string;
+    subaccountId: string;
+    marketId: string;
+    direction: TradeDirection;
+    quantity: number;
+    price: number;
+    fillPrice?: number;
+    leverage: number;
+    isReduceOnly?: boolean;
+  }): MsgCreateDerivativeMarketOrder {
+    const market = this.getMarket(params.marketId);
+    if (!market) {
+      throw new Error(`找不到市场详情: ${params.marketId}`);
+    }
+
+    const isBuy = params.direction === 'BUY';
+    const orderType = isBuy ? OrderTypeMap.BUY : OrderTypeMap.SELL;
+    const decimals = market.quoteTokenDecimals || 6;
+
+    // 1. 严格按市场 minPriceTickSize 与 minQuantityTickSize 对齐，避免链上步长校验报错
+    const alignedPrice = RiskManager.alignPriceToTick(params.price, market, isBuy ? 'UP' : 'DOWN');
+    if (alignedPrice <= 0) {
+      throw new Error(`无效订单价格: ${params.price}`);
+    }
+
+    const qtyTickBn = new BigNumber(market.minQuantityTickSize || 0.001);
+    const alignedQtyBn = new BigNumber(params.quantity)
+      .dividedBy(qtyTickBn)
+      .integerValue(BigNumber.ROUND_FLOOR)
+      .multipliedBy(qtyTickBn);
+
+    if (alignedQtyBn.lt(qtyTickBn) || alignedQtyBn.lte(0)) {
+      throw new Error(`下单数量 ${params.quantity} 低于市场最小单位 ${qtyTickBn.toFixed()}`);
+    }
+
+    // 注意: derivativePriceToChainPriceToFixed 必须传 quoteDecimals 而非 tensMultiplier!
+    const chainPrice = derivativePriceToChainPriceToFixed({
+      value: alignedPrice,
+      quoteDecimals: decimals,
+    });
+    const chainQuantity = derivativeQuantityToChainQuantityToFixed({
+      value: alignedQtyBn.toFixed(),
+    });
+
+    // 2. 保证金核算: 平仓单 (isReduceOnly) 传 '0'；开仓单保证覆盖 initialMarginRatio
+    let chainMargin = '0';
+    if (!params.isReduceOnly) {
+      const maxMarketLev =
+        market.initialMarginRatio > 0 ? Math.max(1, Math.floor(1 / market.initialMarginRatio)) : 20;
+      const safeLeverage = Math.max(1, Math.min(params.leverage || 1, maxMarketLev));
+      const marginRefPrice = isBuy
+        ? alignedPrice
+        : Math.max(alignedPrice, params.fillPrice || alignedPrice);
+      const notional = new BigNumber(marginRefPrice).multipliedBy(alignedQtyBn);
+      const minRequiredMargin = notional.multipliedBy(market.initialMarginRatio || 0.05);
+      const targetMargin = notional.dividedBy(safeLeverage);
+      const finalMargin = BigNumber.maximum(targetMargin, minRequiredMargin);
+
+      chainMargin = derivativeMarginToChainMarginToFixed({
+        value: finalMargin.toFixed(decimals, BigNumber.ROUND_CEIL),
+        quoteDecimals: decimals,
+      });
+    }
+
+    const feeRecipient = this.config.feeRecipient || params.injectiveAddress;
+
+    return MsgCreateDerivativeMarketOrder.fromJSON({
+      injectiveAddress: params.injectiveAddress,
+      subaccountId: params.subaccountId,
+      marketId: params.marketId,
+      orderType,
+      price: chainPrice,
+      quantity: chainQuantity,
+      margin: chainMargin,
+      feeRecipient,
+    });
+  }
+
+  private getUserBroadcaster(injectiveAddress: string, cleanPk: string): MsgBroadcasterWithPk {
+    let bc = this.userBroadcasters.get(injectiveAddress);
+    if (!bc) {
+      bc = new MsgBroadcasterWithPk({
+        privateKey: cleanPk,
+        network: this.config.network,
+        endpoints: {
+          indexer: this.endpoints.indexer,
+          grpc: this.endpoints.grpc,
+          rest: this.endpoints.rest,
+        },
+      });
+      if (this.userBroadcasters.size > 500) {
+        const firstKey = this.userBroadcasters.keys().next().value;
+        if (firstKey) this.userBroadcasters.delete(firstKey);
+      }
+      this.userBroadcasters.set(injectiveAddress, bc);
+    }
+    return bc;
+  }
+
+  /**
    * 构建并广播衍生品市价单 (跟单核心下单接口)
    *
    * @param params 下单参数
@@ -206,54 +383,26 @@ export class InjectiveService {
     direction: TradeDirection;
     quantity: number;
     price: number;
+    fillPrice?: number;
     leverage: number;
+    isReduceOnly?: boolean;
   }): Promise<{ txHash?: string; message: any }> {
     if (!this.followerAddress || !this.followerSubaccountId) {
       throw new Error('未配置跟单钱包，无法执行链上下单。');
     }
 
-    const market = this.getMarket(params.marketId);
-    if (!market) {
-      throw new Error(`找不到市场详情: ${params.marketId}`);
-    }
-
-    const isBuy = params.direction === 'BUY';
-    const orderType = isBuy ? OrderTypeMap.BUY : OrderTypeMap.SELL;
-
-    // 格式化价格与数量
-    const decimals = market.quoteTokenDecimals;
-    const chainPrice = derivativePriceToChainPriceToFixed({
-      value: params.price,
-      tensMultiplier: decimals,
-    });
-    const chainQuantity = derivativeQuantityToChainQuantityToFixed({
-      value: params.quantity,
-    });
-
-    // 计算保证金 Margin = (Price * Quantity) / Leverage
-    const notional = new BigNumber(params.price).multipliedBy(params.quantity);
-    const marginAmount = notional.dividedBy(params.leverage).toNumber();
-    const chainMargin = derivativeMarginToChainMarginToFixed({
-      value: marginAmount,
-      tensMultiplier: decimals,
-    });
-
-    // 手续费接收者: 优先使用设置的 feeRecipient, 其次跟单钱包本身 (捕获 Injective 40% 手续费分成)
-    const feeRecipient = this.config.feeRecipient || this.followerAddress;
-
-    // 构造 MsgCreateDerivativeMarketOrder
-    const orderMsg = MsgCreateDerivativeMarketOrder.fromJSON({
+    const orderMsg = this.buildDerivativeMarketOrderMsg({
       injectiveAddress: this.followerAddress,
       subaccountId: this.followerSubaccountId,
       marketId: params.marketId,
-      orderType,
-      price: chainPrice,
-      quantity: chainQuantity,
-      margin: chainMargin,
-      feeRecipient,
+      direction: params.direction,
+      quantity: params.quantity,
+      price: params.price,
+      fillPrice: params.fillPrice,
+      leverage: params.leverage,
+      isReduceOnly: params.isReduceOnly,
     });
 
-    // 如果为 DRY_RUN 模拟模式，则不实际广播上链
     if (this.config.dryRun) {
       return {
         txHash: `simulated_tx_${Date.now()}_${Math.random().toString(36).substring(7)}`,
@@ -285,7 +434,9 @@ export class InjectiveService {
       direction: TradeDirection;
       quantity: number;
       price: number;
+      fillPrice?: number;
       leverage: number;
+      isReduceOnly?: boolean;
       simulateOnly?: boolean;
     }
   ): Promise<{ txHash: string; message: any; injectiveAddress: string; subaccountId: string }> {
@@ -296,51 +447,16 @@ export class InjectiveService {
     const injectiveAddress = pk.toBech32();
     const subaccountId = getSubaccountId(injectiveAddress, 0);
 
-    const market = this.getMarket(params.marketId);
-    if (!market) {
-      throw new Error(`找不到市场详情: ${params.marketId}`);
-    }
-
-    const isBuy = params.direction === 'BUY';
-    const orderType = isBuy ? OrderTypeMap.BUY : OrderTypeMap.SELL;
-
-    const decimals = market.quoteTokenDecimals;
-    const chainPrice = derivativePriceToChainPriceToFixed({
-      value: params.price,
-      tensMultiplier: decimals,
-    });
-    const chainQuantity = derivativeQuantityToChainQuantityToFixed({
-      value: params.quantity,
-    });
-
-    const notional = new BigNumber(params.price).multipliedBy(params.quantity);
-    const marginAmount = notional.dividedBy(params.leverage).toNumber();
-    const chainMargin = derivativeMarginToChainMarginToFixed({
-      value: marginAmount,
-      tensMultiplier: decimals,
-    });
-
-    const feeRecipient = this.config.feeRecipient || injectiveAddress;
-
-    const orderMsg = MsgCreateDerivativeMarketOrder.fromJSON({
+    const orderMsg = this.buildDerivativeMarketOrderMsg({
       injectiveAddress,
       subaccountId,
       marketId: params.marketId,
-      orderType,
-      price: chainPrice,
-      quantity: chainQuantity,
-      margin: chainMargin,
-      feeRecipient,
-    });
-
-    const userBroadcaster = new MsgBroadcasterWithPk({
-      privateKey: cleanPk,
-      network: this.config.network,
-      endpoints: {
-        indexer: this.endpoints.indexer,
-        grpc: this.endpoints.grpc,
-        rest: this.endpoints.rest,
-      },
+      direction: params.direction,
+      quantity: params.quantity,
+      price: params.price,
+      fillPrice: params.fillPrice,
+      leverage: params.leverage,
+      isReduceOnly: params.isReduceOnly,
     });
 
     if (params.simulateOnly) {
@@ -352,6 +468,7 @@ export class InjectiveService {
       };
     }
 
+    const userBroadcaster = this.getUserBroadcaster(injectiveAddress, cleanPk);
     const response = await userBroadcaster.broadcast({
       msgs: [orderMsg],
     });
@@ -362,5 +479,43 @@ export class InjectiveService {
       injectiveAddress,
       subaccountId,
     };
+  }
+
+  /**
+   * 发送链上代币转账 (用于返佣自动结算发放)
+   */
+  public async sendBankToken(
+    senderPrivateKeyHex: string,
+    dstInjectiveAddress: string,
+    denom: string,
+    amountHuman: number,
+    decimals: number = 6
+  ): Promise<string> {
+    const cleanPk = senderPrivateKeyHex.trim().startsWith('0x')
+      ? senderPrivateKeyHex.trim()
+      : `0x${senderPrivateKeyHex.trim()}`;
+    const pk = PrivateKey.fromHex(cleanPk);
+    const srcInjectiveAddress = pk.toBech32();
+    const chainAmount = new BigNumber(amountHuman)
+      .shiftedBy(decimals)
+      .integerValue(BigNumber.ROUND_FLOOR)
+      .toFixed();
+
+    if (new BigNumber(chainAmount).lte(0)) {
+      throw new Error('转账金额过小');
+    }
+
+    const msg = MsgSend.fromJSON({
+      srcInjectiveAddress,
+      dstInjectiveAddress,
+      amount: {
+        denom,
+        amount: chainAmount,
+      },
+    });
+
+    const bc = this.getUserBroadcaster(srcInjectiveAddress, cleanPk);
+    const resp = await bc.broadcast({ msgs: [msg] });
+    return resp.txHash;
   }
 }

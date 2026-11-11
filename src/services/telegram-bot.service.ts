@@ -50,10 +50,14 @@ export class TelegramBotService {
   private whaleRadar?: any;
   public bot?: Bot;
   private isBotRunning: boolean = false;
+  private pollingReconnectTimer?: NodeJS.Timeout;
   private activeUserChatIds: Set<number> = new Set();
   private awaitingAddressUsers: Set<number> = new Set();
   private awaitingWalletImportUsers: Set<number> = new Set();
   private lastUserNotificationTime: Map<number, number> = new Map();
+  private channelBroadcastCooldowns: Map<string, number> = new Map();
+  private rpcCooldowns: Map<string, number> = new Map();
+  private injPriceCache: { price: number; updatedAt: number } = { price: 3.95, updatedAt: 0 };
 
   constructor(
     config: AppConfig,
@@ -101,6 +105,37 @@ export class TelegramBotService {
     }
   }
 
+  private async getLiveInjPrice(): Promise<number> {
+    if (Date.now() - this.injPriceCache.updatedAt < 60_000) {
+      return this.injPriceCache.price;
+    }
+    try {
+      const ob = await this.copyEngine.getInjectiveService().getOrderbook('INJ/USDC PERP');
+      if (ob.midPrice > 0) {
+        this.injPriceCache = { price: ob.midPrice, updatedAt: Date.now() };
+      }
+    } catch {
+      // keep cached fallback
+    }
+    return this.injPriceCache.price;
+  }
+
+  private isRpcRateLimited(userId: number, action: string, cooldownMs: number = 3000): boolean {
+    const key = `${userId}:${action}`;
+    const now = Date.now();
+    const last = this.rpcCooldowns.get(key) || 0;
+    if (now - last < cooldownMs) {
+      return true;
+    }
+    this.rpcCooldowns.set(key, now);
+    if (this.rpcCooldowns.size > 2000) {
+      for (const [k, ts] of this.rpcCooldowns.entries()) {
+        if (now - ts > 60_000) this.rpcCooldowns.delete(k);
+      }
+    }
+    return false;
+  }
+
   /**
    * 启动 Telegram Bot 监听 (自带 Webhook 清理与 409 冲突自动恢复)
    */
@@ -141,9 +176,10 @@ export class TelegramBotService {
             },
           })
           .catch((err) => {
-            console.warn(`[TelegramBot] 轮询重连中 (${err.message})，3秒后自动恢复...`);
+            console.warn(`[TelegramBot] 轮询重连中 (${err.message})，5秒后自动恢复...`);
             if (this.isBotRunning) {
-              setTimeout(launchPolling, 3000);
+              if (this.pollingReconnectTimer) clearTimeout(this.pollingReconnectTimer);
+              this.pollingReconnectTimer = setTimeout(launchPolling, 5000);
             }
           });
       };
@@ -158,9 +194,13 @@ export class TelegramBotService {
    * 停止 Bot
    */
   public async stop() {
-    if (this.bot && this.isBotRunning) {
-      await this.bot.stop();
-      this.isBotRunning = false;
+    this.isBotRunning = false;
+    if (this.pollingReconnectTimer) {
+      clearTimeout(this.pollingReconnectTimer);
+      this.pollingReconnectTimer = undefined;
+    }
+    if (this.bot) {
+      await this.bot.stop().catch(() => {});
     }
   }
 
@@ -202,7 +242,8 @@ export class TelegramBotService {
     const userCopy = this.walletService.getUserCopyState(userId);
     const targets = this.walletService.getUserTargets(userId);
     const isPractice = this.walletService.isPracticeMode(userId);
-    const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
+    const injPrice = await this.getLiveInjPrice();
+    const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress, injPrice);
 
     let targetDesc = '';
     if (targets.length === 0) {
@@ -214,7 +255,7 @@ export class TelegramBotService {
       targetDesc = `🎯 已同时监控 ${targets.length} 位巨鲸: ${listStr}`;
     }
 
-    const hasRealFunds = parseFloat(balances.usdt) > 0 || parseFloat(balances.inj) > 0;
+    const hasRealFunds = parseFloat(balances.stableUsd) > 0 || parseFloat(balances.inj) > 0;
     const execModeBanner = isPractice
       ? '【🧪 模拟盘演练 (虚拟体验金扣款，不上链不耗 Gas)】'
       : '【🔴 实盘链上模式 (专属钱包私钥签名，Mainnet 真实上链)】';
@@ -235,8 +276,13 @@ export class TelegramBotService {
     const availPractice = userWallet.practiceBalanceUsdt ?? 10000;
 
     const balanceDisplay = isPractice
-      ? `• <b>体验金可用本金</b>: <b>$${availPractice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT</b>\n• <b>模拟持仓占用保证金</b>: <b>$${usedPracticeMargin.toFixed(2)} USDT (${positions.length} 笔持仓)</b>\n• <b>链上实际存入</b>: <code>${balances.inj} INJ</code> | <code>${balances.usdt} USDT</code>`
-      : `• <b>链上实盘资产</b>: <b>${balances.inj} INJ</b> | <b>${balances.usdt} USDT</b> (估值 ~$${balances.totalUsd} USD)`;
+      ? `• <b>体验金可用本金</b>: <b>$${availPractice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT</b>\n• <b>模拟持仓占用保证金</b>: <b>$${usedPracticeMargin.toFixed(2)} USDT (${positions.length} 笔持仓)</b>\n• <b>链上实际存入</b>: <code>${balances.inj} INJ</code> | <code>${balances.usdt} USDT</code> | <code>${balances.usdc} USDC</code>`
+      : `• <b>链上实盘资产</b>: <b>${balances.inj} INJ</b> | <b>${balances.usdt} USDT</b> | <b>${balances.usdc} USDC</b> (估值 ~$${balances.totalUsd} USD)`;
+
+    const sizingLabel =
+      userCopy.copyMode === 'RATIO'
+        ? `按巨鲸 ${(userCopy.copyRatio * 100).toFixed(1)}% 比例 (上限 $${userCopy.maxNotionalPerOrder})`
+        : `$${userCopy.copyAmountUsdt} USDT/单`;
 
     return `
 🔥 <b>Injective 链上聪明钱一键跟单系统</b>
@@ -250,9 +296,9 @@ ${balanceDisplay}
 🎯 <b>多巨鲸跟单引擎状态</b>:
 • <b>监听目标</b>: ${targetDesc}
 • <b>执行引擎模式</b>: <b>${execModeBanner}</b>
-• <b>单笔金额</b>: <b>$${userCopy.copyAmountUsdt} USDT/单</b>
+• <b>单笔金额</b>: <b>${sizingLabel}</b>
 • <b>运行状态</b>: <b>${modeText}</b>
-• <b>风控保护</b>: 杠杆 <b>${this.config.maxLeverage}x</b> | 滑点保护 <b>${this.config.maxSlippagePercent}%</b>
+• <b>风控保护</b>: 杠杆 <b>${userCopy.maxLeverage}x</b> | 滑点保护 <b>${userCopy.maxSlippagePercent}%</b>
 • <b>响应延迟</b>: 🟢 毫秒级极速响应 24h 待命
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 👇 <b>请在下方轻点按钮进行操作:</b>
@@ -289,7 +335,7 @@ ${balanceDisplay}
   }
 
   /**
-   * 渲染专业级实时盈亏、持仓明细与战绩看板 (支持刷新、一键全平、重置体验金)
+   * 渲染专业级实时盈亏、持仓明细与战绩看板 (严格区分实盘链上持仓与模拟盘体验金持仓)
    */
   public async renderPortfolioAndStats(ctx: any, isEdit: boolean = false) {
     const userId = ctx.from?.id || 0;
@@ -297,6 +343,7 @@ ${balanceDisplay}
     const isPractice = this.walletService.isPracticeMode(userId);
     const targets = this.walletService.getUserTargets(userId);
     const engineStats = this.copyEngine.getStats();
+    const injService = this.copyEngine.getInjectiveService();
 
     let targetDisplay = '暂未选择 (待添加巨鲸)';
     if (targets.length > 0) {
@@ -305,8 +352,93 @@ ${balanceDisplay}
         .join(' | ');
     }
 
+    if (!isPractice) {
+      const injPrice = await this.getLiveInjPrice();
+      const [balances, realPositions] = await Promise.all([
+        this.walletService.getRealBalances(userWallet.injectiveAddress, injPrice),
+        injService.getSubaccountPositions(userWallet.subaccountId).catch(() => []),
+      ]);
+
+      let totalUpnl = 0;
+      let totalRealMargin = 0;
+      const realCards: string[] = [];
+      for (const pos of realPositions) {
+        totalUpnl += pos.unrealizedPnl;
+        totalRealMargin += pos.margin;
+        const sign = pos.unrealizedPnl >= 0 ? '+' : '';
+        const pnlEmoji = pos.unrealizedPnl >= 0 ? '🟢' : '🔴';
+        const dirEmoji = pos.direction === 'long' ? '🟢' : '🔴';
+        const dirText = pos.direction === 'long' ? '多 (LONG)' : '空 (SHORT)';
+        const roi = pos.margin > 0 ? ((pos.unrealizedPnl / pos.margin) * 100).toFixed(2) : '0.00';
+        const cleanTicker = pos.ticker.replace('/USDC PERP', '').replace('/USDT PERP', '');
+        const lev = pos.margin > 0 ? Math.max(1, Math.round((pos.markPrice * pos.quantity) / pos.margin)) : 1;
+
+        realCards.push(
+          `┌── ${dirEmoji} <b>${cleanTicker}</b> (<code>${lev}x ${dirText}</code>)\n` +
+            `│ 链上浮盈: ${pnlEmoji} <b>${sign}$${pos.unrealizedPnl.toFixed(2)} USD (${sign}${roi}%)</b>\n` +
+            `│ 持仓数量: <b>${pos.quantity}</b> | 保证金: <b>$${pos.margin.toFixed(2)}</b>\n` +
+            `│ 开仓均价: <code>$${formatDisplayPrice(pos.entryPrice)}</code> ➔ 标记价: <code>$${formatDisplayPrice(pos.markPrice)}</code>\n` +
+            `└──────────────────────────`
+        );
+      }
+
+      const uSign = totalUpnl >= 0 ? '+' : '';
+      const uEmoji = totalUpnl >= 0 ? '🟢' : '🔴';
+      const realEquity = Number((balances.totalUsd + totalRealMargin + totalUpnl).toFixed(2));
+      let posBlock =
+        realCards.length > 0 ? realCards.slice(0, 6).join('\n\n') : '  ⚪ 当前链上子账户暂无活动持仓';
+      if (realCards.length > 6) {
+        posBlock += `\n\n<i>... 还有 ${realCards.length - 6} 笔链上持仓</i>`;
+      }
+
+      let realText = `
+📊 <b>【实盘账户实时资产与持仓看板 (Mainnet)】</b>
+
+• <b>执行引擎模式</b>: <b>🔴 实盘链上交易 (专属钱包私钥真实签名上链)</b>
+• <b>跟单巨鲸矩阵</b>: <b>${targetDisplay}</b>
+
+┌── 💰 <b>链上实时资产概览</b> ─────────
+│ 💎 估算账户总净值: <b>$${realEquity.toFixed(2)} USD</b>
+│ 💵 可用稳定币: <b>${balances.usdt} USDT</b> | <b>${balances.usdc} USDC</b>
+│ 🪙 可用 Gas 资产: <b>${balances.inj} INJ</b>
+│ 🔒 链上占用保证金: <b>$${totalRealMargin.toFixed(2)} USD</b> (${realPositions.length} 笔持仓)
+│ 📈 实时链上总浮盈: ${uEmoji} <b>${uSign}$${totalUpnl.toFixed(2)} USD</b>
+└────────────────────────────
+
+📈 <b>链上实盘活动持仓 (${realPositions.length} 笔):</b>
+${posBlock}
+
+⚡ <b>信号引擎指标:</b>
+• 累计捕获信号: <b>${engineStats.total} 笔</b> | 放行跟单: <b>${engineStats.success} 笔</b> | 风控拦截: <b>${engineStats.total - engineStats.success} 笔</b>
+      `.trim();
+
+      if (realText.length > 3800) {
+        realText = realText.slice(0, 3750) + '\n\n<i>(持仓数较多，已自动精简展示)</i>';
+      }
+
+      const realKb = new InlineKeyboard().text('🔄 刷新链上实时持仓与浮盈', 'view_stats').row();
+      if (realPositions.length > 0) {
+        realKb.text(`⚡ 一键市价全平实盘持仓 (${realPositions.length} 仓)`, 'close_all_real_pos').row();
+      }
+      realKb
+        .text('🧪 切换为模拟演练', 'switch_mode_practice')
+        .text('👛 返回我的钱包', 'view_wallet')
+        .row()
+        .text('🔙 返回主菜单', 'back_to_menu');
+
+      if (isEdit) {
+        try {
+          await ctx.editMessageText(realText, { parse_mode: 'HTML', reply_markup: realKb });
+          return;
+        } catch {
+          // fallback to reply
+        }
+      }
+      await ctx.reply(realText, { parse_mode: 'HTML', reply_markup: realKb }).catch(() => {});
+      return;
+    }
+
     const positions = userWallet.practicePositions || [];
-    const injService = this.copyEngine.getInjectiveService();
 
     // 1. 并发获取持仓标的的最新盘口价格以计算实时未实现浮盈
     const markPriceMap = new Map<string, number>();
@@ -366,7 +498,7 @@ ${balanceDisplay}
       );
     }
 
-    const availBalance = isPractice ? (userWallet.practiceBalanceUsdt ?? 10000) : 0;
+    const availBalance = userWallet.practiceBalanceUsdt ?? 10000;
     const totalEquity = Number((availBalance + totalUsedMargin + totalUnrealizedPnlUsdt).toFixed(2));
     const realizedPnl = userWallet.practiceRealizedPnlUsdt ?? 0;
     const totalRoi = (((totalEquity - 10000) / 10000) * 100).toFixed(2);
@@ -390,9 +522,7 @@ ${balanceDisplay}
       return `  • ${hEmoji} <b>${cleanH} (${hDir})</b>: 开 $${formatDisplayPrice(h.entryPrice)} ➔ 平 $${formatDisplayPrice(h.exitPrice)} | 盈亏: <b>${hSign}$${h.netPnlUsdt.toFixed(2)} USDT</b>`;
     });
 
-    const execModeDesc = isPractice
-      ? '🧪 模拟盘演练 (虚拟体验金毫秒撮合，不上链不耗 Gas)'
-      : '🔴 实盘链上交易 (专属钱包私钥真实签名上链)';
+    const execModeDesc = '🧪 模拟盘演练 (虚拟体验金毫秒撮合，不上链不耗 Gas)';
 
     const maxDisplay = 5;
     const displayedPositions = positionCards.slice(0, maxDisplay);
@@ -495,7 +625,8 @@ ${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记�
       }
     }
 
-    const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
+    const injPrice = await this.getLiveInjPrice();
+    const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress, injPrice);
     const isPractice = this.walletService.isPracticeMode(userId);
     const positions = userWallet.practicePositions || [];
     const usedMargin = positions.reduce((sum, p) => sum + (p.marginUsdt || 0), 0);
@@ -523,6 +654,7 @@ ${historyLines.length > 0 ? historyLines.join('\n') : '  ⚪ 暂无已交割记�
 ┌── 📊 <b>链上真实资产与模式详情</b> ─────────
 │ 💎 <b>链上 INJ 余额</b>: <code>${balances.inj} INJ</code>
 │ 💵 <b>链上 USDT 余额</b>: <code>${balances.usdt} USDT</code>
+│ 💲 <b>链上 USDC 余额</b>: <code>${balances.usdc} USDC</code>
 │ 💰 <b>当前实盘总估值</b>: <b>$${balances.totalUsd} USD</b>
 │ 🕒 <b>数据同步时间</b>: <code>${refreshTime} (UTC+8)</code>
 └────────────────────────────
@@ -611,27 +743,35 @@ ${practiceInfo}
     }
 
     let text = `🏆 <b>Injective 主网实盘活跃巨鲸排行榜 (100% 链上实时数据)</b>\n`;
-    text += `<i>实时扫描主网前 1,000 个大户实盘仓位，已自动剔除僵尸死仓，仅精选 24h 内高频活跃盈利巨鲸</i>\n\n`;
+    text += `<i>已全量扫描主网活跃实盘仓位，过滤做市商/刷量机器人与 14 天以上死仓，优先展示近 24h~14 天内仍在交易的真实盈利账号</i>\n\n`;
     const keyboard = new InlineKeyboard();
 
-    whales.forEach((w) => {
-      const upnlSign = w.unrealizedPnlUsd >= 0 ? '+' : '';
-      text += `<b>Top ${w.rank}. ${w.name}</b> ${w.badge}\n`;
-      text += `• 最近链上异动: <b>${w.lastActiveDesc}</b>\n`;
-      text += `• 实盘未平仓总规模: <b>$${w.volumeUsd.toLocaleString()} USD</b> (${w.openPositionsCount} 个仓位)\n`;
-      text += `• 当前持仓总浮盈: <b>${upnlSign}$${w.unrealizedPnlUsd.toLocaleString()} USD</b>\n`;
-      text += `• 实盘综合胜率: <b>${w.winRatePercent}%</b>\n`;
-      text += `• 头号重仓明细: <i>${w.strategy}</i>\n`;
-      text += `• 钱包地址: <code>${w.address}</code>\n\n`;
+    if (whales.length === 0) {
+      text += `⚠️ 当前近 14 天内暂无符合条件的非做市商正浮盈实盘大户（Injective 链上近期以做市与高频对倒为主）。\n\n💡 你可以通过下方「🔍 监控自定义钱包」手动添加已知聪明钱地址。\n\n`;
+    } else {
+      whales.forEach((w) => {
+        const upnlSign = w.unrealizedPnlUsd >= 0 ? '+' : '';
+        text += `<b>Top ${w.rank}. ${w.name}</b> ${w.badge}\n`;
+        text += `• 最近链上异动: <b>${w.lastActiveDesc}</b>\n`;
+        text += `• 实盘未平仓总规模: <b>$${w.volumeUsd.toLocaleString()} USD</b> (${w.openPositionsCount} 个仓位)\n`;
+        text += `• 当前持仓总浮盈: <b>${upnlSign}$${w.unrealizedPnlUsd.toLocaleString()} USD</b>\n`;
+        text += `• 实盘综合胜率: <b>${w.winRatePercent}%</b>\n`;
+        text += `• 头号重仓明细: <i>${w.strategy}</i>\n`;
+        text += `• 钱包地址: <code>${w.address}</code>\n\n`;
 
-      keyboard.text(`⚡ 跟单 Top ${w.rank} (0x${w.address.slice(-4)})`, `follow_${w.id}`).row();
-    });
+        keyboard.text(`⚡ 跟单 Top ${w.rank} (0x${w.address.slice(-4)})`, `follow_${w.id}`).row();
+      });
+    }
 
     keyboard
       .text('🔄 实时重扫主网巨鲸', 'refresh_leaderboard')
       .text('🔍 监控自定义钱包', 'track_custom_wallet')
       .row()
       .text('🔙 返回主菜单', 'back_to_menu');
+
+    if (text.length > 3900) {
+      text = text.slice(0, 3850) + '\n\n<i>(榜单内容较长，已自动精简展示)</i>';
+    }
 
     try {
       await ctx.editMessageText(text, {
@@ -642,7 +782,7 @@ ${practiceInfo}
       await ctx.reply(text, {
         parse_mode: 'HTML',
         reply_markup: keyboard,
-      });
+      }).catch(() => {});
     }
   }
 
@@ -685,15 +825,33 @@ ${practiceInfo}
   private setupBotHandlers() {
     if (!this.bot) return;
 
-    // 仅记录必要指令输入，过滤所有按钮点击刷屏，降低服务器日志负担
+    // 访问控制（若配置了 ALLOWED_TELEGRAM_IDS）+ 清理待输入状态 + 指令日志
     this.bot.use(async (ctx, next) => {
+      const userId = ctx.from?.id;
+      if (
+        this.config.allowedTelegramIds &&
+        this.config.allowedTelegramIds.length > 0 &&
+        (!userId || !this.config.allowedTelegramIds.includes(userId))
+      ) {
+        if (ctx.callbackQuery) {
+          await ctx.answerCallbackQuery({ text: '⛔ 暂无访问权限', show_alert: true }).catch(() => {});
+        } else if (ctx.message) {
+          await ctx.reply('⛔ 当前机器人已开启白名单访问限制，请联系管理员授权。').catch(() => {});
+        }
+        return;
+      }
+
       if (ctx.message?.text?.startsWith('/')) {
-        console.log(`[TelegramBot] 指令 @${ctx.from?.username || ctx.from?.id}: ${ctx.message.text}`);
+        if (userId) {
+          this.awaitingAddressUsers.delete(userId);
+          this.awaitingWalletImportUsers.delete(userId);
+        }
+        console.log(`[TelegramBot] 指令 @${ctx.from?.username || userId}: ${ctx.message.text}`);
       }
       await next();
     });
 
-    // 1. /start 与 /menu 指令
+    // 1. /start 与 /menu 指令 (支持 ref_<id> 邀请绑定与 follow_<inj1...> 频道深链一键跟单)
     this.bot.command('start', async (ctx) => {
       const match = (ctx.match || '').trim();
       const userId = ctx.from?.id || 0;
@@ -710,13 +868,20 @@ ${practiceInfo}
             try {
               await ctx.api.sendMessage(
                 inviterId,
-                `🎁 <b>【新好友成功加入提醒】</b>\n好友 @${ctx.from?.username || userId} (<code>${userId}</code>) 已通过您的专属推广链接加入机器人！后续该好友每笔跟单成交，您都将自动获得 <b>25% 手续费现金返佣</b>！`,
+                `🎁 <b>【新好友成功加入提醒】</b>\n好友 @${ctx.from?.username || userId} (<code>${userId}</code>) 已通过您的专属推广链接加入机器人！后续该好友每笔实盘跟单成交，您都将自动获得 <b>${this.config.referralRewardPercent}% 手续费现金返佣</b>！`,
                 { parse_mode: 'HTML' }
               );
             } catch {
               // ignore
             }
           }
+        }
+      } else if (match.startsWith('follow_')) {
+        const rawAddr = match.replace('follow_', '').trim();
+        const check = validateInjectiveAddress(rawAddr);
+        if (check.valid && check.cleanAddress) {
+          await this.applyFollowTarget(ctx, check.cleanAddress, false);
+          return;
         }
       }
       await this.renderMainMenu(ctx, false);
@@ -743,17 +908,17 @@ ${practiceInfo}
       `.trim();
 
       const keyboard = new InlineKeyboard().text('🔙 返回主菜单', 'back_to_menu');
-      await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard });
+      await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
     });
 
-    this.bot.command('leaderboard', (ctx) => {
-      ctx.reply('🏆 轻点下方按钮查看链上聪明钱实时胜率排行：', {
+    this.bot.command('leaderboard', async (ctx) => {
+      await ctx.reply('🏆 轻点下方按钮查看链上聪明钱实时胜率排行：', {
         reply_markup: new InlineKeyboard().text('🏆 立即查看聪明钱排行榜', 'view_leaderboard'),
-      });
+      }).catch(() => {});
     });
 
-    this.bot.command('amount', (ctx) => {
-      ctx.reply('请选择单笔跟单金额：', {
+    this.bot.command('amount', async (ctx) => {
+      await ctx.reply('请选择单笔跟单金额：', {
         reply_markup: new InlineKeyboard()
           .text('$20 USDT', 'amt_20')
           .text('$50 USDT', 'amt_50')
@@ -762,15 +927,15 @@ ${practiceInfo}
           .text('$200 USDT', 'amt_200')
           .row()
           .text('🔙 返回主菜单', 'back_to_menu'),
-      });
+      }).catch(() => {});
     });
 
-    this.bot.command('referral', (ctx) => {
+    this.bot.command('referral', async (ctx) => {
       const refLink = `https://t.me/${ctx.me.username}?start=ref_${ctx.from?.id || '888'}`;
-      ctx.reply(
-        `🎁 <b>您的专属推广链接：</b>\n<code>${refLink}</code>\n\n好友使用享 25% 终身手续费现金分红！`,
+      await ctx.reply(
+        `🎁 <b>您的专属推广链接：</b>\n<code>${refLink}</code>\n\n好友使用实盘跟单享 ${this.config.referralRewardPercent}% 终身手续费现金分红！`,
         { parse_mode: 'HTML' }
-      );
+      ).catch(() => {});
     });
 
     this.bot.command('stats', (ctx) => this.renderPortfolioAndStats(ctx, false));
@@ -781,9 +946,10 @@ ${practiceInfo}
       const text = (ctx.message.text || '').trim();
       const userId = ctx.from?.id || 0;
 
-      // 等待导入助记词或私钥
+      // 等待导入助记词或私钥 (立即尝试撤回用户发送的敏感明文消息，降低聊天记录泄露风险)
       if (this.awaitingWalletImportUsers.has(userId)) {
         this.awaitingWalletImportUsers.delete(userId);
+        await ctx.deleteMessage().catch(() => {});
         try {
           const imported = this.walletService.importWallet(userId, text, ctx.from?.username);
           const mnemonicHint = imported.mnemonic ? '（含 12/24 位助记词）' : '（Hex 私钥）';
@@ -798,7 +964,7 @@ ${practiceInfo}
 
 • <b>导入类型</b>: <b>${mnemonicHint}</b>
 
-🛡️ <i>您的模拟盘体验金与跟单巨鲸配置已无缝保留。您可以点击下方按钮查看钱包详情或前往 Injective 区块浏览器核验！</i>
+🛡️ <i>系统已自动尝试撤回您刚才发送的明文凭据消息以保护安全，您的模拟盘体验金与跟单巨鲸配置已无缝保留！</i>
           `.trim();
 
           const keyboard = new InlineKeyboard()
@@ -807,7 +973,7 @@ ${practiceInfo}
             .row()
             .text('🔙 返回主菜单', 'back_to_menu');
 
-          await ctx.reply(successText, { parse_mode: 'HTML', reply_markup: keyboard });
+          await ctx.reply(successText, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
         } catch (err: any) {
           const errText = `
 ❌ <b>钱包导入失败</b>
@@ -821,7 +987,7 @@ ${practiceInfo}
             .text('📥 重新尝试导入', 'import_wallet_prompt')
             .text('🔙 返回我的钱包', 'view_wallet');
 
-          await ctx.reply(errText, { parse_mode: 'HTML', reply_markup: keyboard });
+          await ctx.reply(errText, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
         }
         return;
       }
@@ -844,7 +1010,7 @@ ${practiceInfo}
             .text('🔍 查询该地址链上资产', `inspect_addr_${cleanAddr}`)
             .row()
             .text('🔙 返回主菜单', 'back_to_menu');
-          await ctx.reply(promptText, { parse_mode: 'HTML', reply_markup: keyboard });
+          await ctx.reply(promptText, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
           return;
         }
       }
@@ -868,6 +1034,7 @@ ${practiceInfo}
     // 监控自定义钱包
     this.bot.callbackQuery('track_custom_wallet', async (ctx) => {
       this.awaitingAddressUsers.add(ctx.from?.id || 0);
+      await ctx.answerCallbackQuery().catch(() => {});
       const text = `
 🔍 <b>【请输入您要监控并跟单的 Injective 钱包地址】</b>
 
@@ -879,15 +1046,19 @@ ${practiceInfo}
       `.trim();
 
       const keyboard = new InlineKeyboard().text('🔙 返回主菜单', 'back_to_menu');
-      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }).catch(async () => {
+        await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
+      });
     });
 
     // 查看聪明钱排行榜 (若距上次刷新超过 15 秒，自动拉取最新盘口浮盈与最新成交时间)
     this.bot.callbackQuery('view_leaderboard', async (ctx) => {
+      const userId = ctx.from?.id || 0;
       await ctx.answerCallbackQuery('正在读取最新链上实盘数据...').catch(() => {});
       if (
-        Date.now() - this.leaderboard.getLastRefreshTime() > 15000 ||
-        this.leaderboard.getTopWhales(5).length === 0
+        !this.isRpcRateLimited(userId, 'leaderboard', 5000) &&
+        (Date.now() - this.leaderboard.getLastRefreshTime() > 15000 ||
+          this.leaderboard.getTopWhales(5).length === 0)
       ) {
         await this.leaderboard.refreshLeaderboard();
       }
@@ -895,6 +1066,11 @@ ${practiceInfo}
     });
 
     this.bot.callbackQuery('refresh_leaderboard', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      if (this.isRpcRateLimited(userId, 'refresh_leaderboard', 8000)) {
+        await ctx.answerCallbackQuery('⏳ 刷新太频繁，请几秒后再试').catch(() => {});
+        return;
+      }
       await ctx.answerCallbackQuery('正在重扫 Injective 主网最新区块成交...').catch(() => {});
       await this.leaderboard.refreshLeaderboard();
       await this.renderLeaderboardView(ctx);
@@ -904,8 +1080,9 @@ ${practiceInfo}
     this.bot.callbackQuery('switch_mode_real', async (ctx) => {
       const userId = ctx.from?.id || 0;
       const userWallet = this.walletService.getOrCreateWallet(userId, ctx.from?.username);
-      const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
-      const hasRealFunds = parseFloat(balances.usdt) > 0 || parseFloat(balances.inj) > 0;
+      const injPrice = await this.getLiveInjPrice();
+      const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress, injPrice);
+      const hasRealFunds = parseFloat(balances.stableUsd) > 0 || parseFloat(balances.inj) > 0;
 
       if (!hasRealFunds) {
         await ctx
@@ -916,7 +1093,7 @@ ${practiceInfo}
 
 检测到您的专属非托管钱包当前实盘余额为 0：
 • 专属地址: <code>${userWallet.injectiveAddress}</code>
-• 链上余额: <b>${balances.inj} INJ / ${balances.usdt} USDT</b>
+• 链上余额: <b>${balances.inj} INJ / ${balances.usdt} USDT / ${balances.usdc} USDC</b>
 
 💡 <b>实盘链上交易模式</b>将使用您专属钱包私钥直接签名并在 Injective Mainnet 真实扣款下单。请先向您的专属地址充值 USDT 与少量 INJ (Gas)，或继续使用 $10,000 模拟演练模式：
         `.trim();
@@ -940,7 +1117,7 @@ ${practiceInfo}
 
 • <b>当前执行模式</b>: <b>🔴 实盘链上交易 (Mainnet 真实签名广播)</b>
 • <b>签名账户</b>: <code>${userWallet.injectiveAddress}</code>
-• <b>实盘可用余额</b>: <b>${balances.inj} INJ | ${balances.usdt} USDT</b>
+• <b>实盘可用余额</b>: <b>${balances.inj} INJ | ${balances.usdt} USDT | ${balances.usdc} USDC</b>
 
 ⚡ <i>从现在起，跟单矩阵捕获到的每一笔巨鲸信号都将使用您的专属钱包私钥真实签名上链，并推送附带 Injective 主网区块浏览器链接 (injscan.com) 的实盘战报！</i>
       `.trim();
@@ -979,7 +1156,12 @@ ${practiceInfo}
 
     // 钱包详情与余额刷新 (支持即时反馈与最新时间戳展示)
     this.bot.callbackQuery(['view_wallet', 'refresh_wallet'], async (ctx) => {
+      const userId = ctx.from?.id || 0;
       const isRefresh = ctx.callbackQuery?.data === 'refresh_wallet';
+      if (isRefresh && this.isRpcRateLimited(userId, 'refresh_wallet', 3000)) {
+        await ctx.answerCallbackQuery('⏳ 请稍候再刷新').catch(() => {});
+        return;
+      }
       await this.renderWalletDetail(ctx, true, isRefresh);
     });
 
@@ -987,10 +1169,12 @@ ${practiceInfo}
     this.bot.callbackQuery('deposit_guide', async (ctx) => {
       const userId = ctx.from?.id || 0;
       const userWallet = this.walletService.getOrCreateWallet(userId, ctx.from?.username);
-      const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
+      await ctx.answerCallbackQuery().catch(() => {});
+      const injPrice = await this.getLiveInjPrice();
+      const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress, injPrice);
 
       const text = `
-💳 <b>【充值 USDT / INJ 激活实盘交易】</b>
+💳 <b>【充值 USDT / USDC / INJ 激活实盘交易】</b>
 
 您的专属充值地址:
 <code>${userWallet.injectiveAddress}</code>
@@ -998,7 +1182,7 @@ ${practiceInfo}
 
 📌 <b>便捷充值方式:</b>
 1. <b>中心化交易所提现</b> (币安 Binance, OKX, Bybit 等):
-   • 提币币种选择 <b>INJ</b> 或 <b>USDT</b>
+   • 提币币种选择 <b>INJ</b>、<b>USDT</b> 或 <b>USDC</b> (多数永续合约使用 USDC/USDT 结算)
    • 网络务必选择 <b>Injective (INJ)</b>
    • 填入上方您的专属地址，通常 1-2 分钟内秒级到账
 
@@ -1007,7 +1191,7 @@ ${practiceInfo}
    • 从 Cosmos 生态 (IBC 转账): Keplr 一键直达
 
 📊 <b>实时到账状态</b>:
-• 当前 INJ: <code>${balances.inj} INJ</code> | 当前 USDT: <code>${balances.usdt} USDT</code>
+• 当前 INJ: <code>${balances.inj} INJ</code> | USDT: <code>${balances.usdt} USDT</code> | USDC: <code>${balances.usdc} USDC</code>
 • 充值到账后系统将自动识别，无需等待人工审核！
       `.trim();
 
@@ -1022,7 +1206,7 @@ ${practiceInfo}
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
         reply_markup: keyboard,
-      });
+      }).catch(() => {});
     });
 
     // 开启体验金模式
@@ -1052,7 +1236,7 @@ ${practiceInfo}
       await ctx.editMessageText(text, {
         parse_mode: 'HTML',
         reply_markup: keyboard,
-      });
+      }).catch(() => {});
     });
 
     // 开启体验金并直接锁定某目标 (callback_data 长度: 12 + 42 = 54 <= 64 bytes)
@@ -1068,6 +1252,11 @@ ${practiceInfo}
     this.bot.callbackQuery('export_key', async (ctx) => {
       const userId = ctx.from?.id || 0;
       const userWallet = this.walletService.getOrCreateWallet(userId, ctx.from?.username);
+      if (userWallet.decryptionError) {
+        await ctx.answerCallbackQuery({ text: '⚠️ 钱包解密异常，请联系管理员检查加密密钥', show_alert: true }).catch(() => {});
+        return;
+      }
+      await ctx.answerCallbackQuery().catch(() => {});
 
       const mnemonicBlock = userWallet.mnemonic
         ? `• <b>12 位标准英文助记词:</b>\n<code>${userWallet.mnemonic}</code>\n<i>(轻点上方助记词可直接复制。可直接导入 Keplr、OKX Web3 钱包、MetaMask 或 Leap 验证同一链上地址！)</i>`
@@ -1100,7 +1289,7 @@ ${mnemonicBlock}
         .text('🔙 返回我的钱包', 'view_wallet')
         .text('🔙 返回主菜单', 'back_to_menu');
 
-      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
     });
 
     // 重新生成带 12 位助记词的新钱包
@@ -1130,7 +1319,7 @@ ${mnemonicBlock}
         .text('👛 查看我的钱包', 'view_wallet')
         .text('🔙 返回主菜单', 'back_to_menu');
 
-      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
     });
 
     // 提示用户输入要导入的助记词或私钥
@@ -1149,7 +1338,7 @@ ${mnemonicBlock}
    例如: <code>0x4f3edf983ac636a65a762ce43809197b5b04113345e4c0557e823804418ffb2a</code>
 
 🛡️ <b>安全承诺:</b>
-• 密钥仅在您的独立配置中安全保存，用于签名链上交易，绝不上传任何云端或第三方服务器！
+• 收到后系统将尝试立即撤回您发出的明文消息，密钥使用 AES-256-GCM 加密保存！
 • 导入后您的模拟体验金余额与已添加的跟单巨鲸目标将完整保留！
       `.trim();
 
@@ -1157,7 +1346,7 @@ ${mnemonicBlock}
         .text('🔙 取消并返回钱包', 'view_wallet')
         .text('🔙 返回主菜单', 'back_to_menu');
 
-      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
     });
 
     // 开启自动跟单
@@ -1166,8 +1355,9 @@ ${mnemonicBlock}
       const copyState = this.walletService.getUserCopyState(userId);
       const targets = this.walletService.getUserTargets(userId);
       const userWallet = this.walletService.getOrCreateWallet(userId, ctx.from?.username);
-      const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
-      const hasRealFunds = parseFloat(balances.usdt) > 0 || parseFloat(balances.inj) > 0;
+      const injPrice = await this.getLiveInjPrice();
+      const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress, injPrice);
+      const hasRealFunds = parseFloat(balances.stableUsd) > 0 || parseFloat(balances.inj) > 0;
 
       // 1. 检查是否已指定跟单目标
       if (targets.length === 0) {
@@ -1185,7 +1375,7 @@ ${mnemonicBlock}
           .row()
           .text('🔙 返回主菜单', 'back_to_menu');
 
-        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
         return;
       }
 
@@ -1196,11 +1386,10 @@ ${mnemonicBlock}
         return;
       }
 
-      // 3. 启动多巨鲸跟单矩阵
+      // 3. 启动多巨鲸跟单矩阵 (绝不污染全局 config)
       this.walletService.setUserCopying(userId, true);
       for (const t of targets) {
-        this.config.targetTraderAddress = t.address;
-        await this.tracker.addTrackedTrader(t.address);
+        await this.tracker.addTrackedTrader(t.address, t.subaccountIndex ?? 0);
       }
       await ctx.answerCallbackQuery('🚀 多巨鲸自动跟单矩阵已启动！').catch(() => {});
       await this.renderMainMenu(ctx, true);
@@ -1236,6 +1425,11 @@ ${mnemonicBlock}
         ? '【🧪 模拟盘演练 (虚拟体验金扣款，不上链不耗 Gas)】'
         : '【🔴 实盘链上交易模式 (专属钱包私钥签名上链 Mainnet)】';
 
+      const modeLabel =
+        copyState.copyMode === 'RATIO'
+          ? `按比例 (${(copyState.copyRatio * 100).toFixed(1)}%, 单笔上限 $${copyState.maxNotionalPerOrder})`
+          : `固定金额 ($${copyState.copyAmountUsdt} USDT)`;
+
       const text = `
 ⚡ <b>【多巨鲸跟单矩阵 & 执行引擎设置】</b>
 
@@ -1243,8 +1437,8 @@ ${mnemonicBlock}
 • <b>执行引擎模式</b>: <b>${execModeDesc}</b>
 • <b>当前同时跟单巨鲸 (${targets.length}/5)</b>:
 ${targetsLines}
-• <b>单笔金额</b>: <b>$${copyState.copyAmountUsdt} USDT</b>
-• <b>杠杆倍数限制</b>: <b>${this.config.maxLeverage}x</b> | <b>最大滑点保护</b>: <b>${this.config.maxSlippagePercent}%</b>
+• <b>仓位模式</b>: <b>${modeLabel}</b>
+• <b>杠杆倍数限制</b>: <b>${copyState.maxLeverage}x</b> | <b>最大滑点保护</b>: <b>${copyState.maxSlippagePercent}%</b>
       `.trim();
 
       const keyboard = new InlineKeyboard()
@@ -1266,7 +1460,8 @@ ${targetsLines}
         .row()
         .text('🔙 返回主菜单', 'back_to_menu');
 
-      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+      await ctx.answerCallbackQuery().catch(() => {});
+      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
     });
 
     // 单独移除某个跟单巨鲸 (callback: unfollow_<8位后缀>)
@@ -1312,7 +1507,8 @@ ${targetsLines}
     this.bot.callbackQuery(/^inspect_addr_(.+)$/, async (ctx) => {
       const addr = ctx.match[1];
       await ctx.answerCallbackQuery('正在查询该地址链上余额...').catch(() => {});
-      const balances = await this.walletService.getRealBalances(addr);
+      const injPrice = await this.getLiveInjPrice();
+      const balances = await this.walletService.getRealBalances(addr, injPrice);
       const inspectText = `
 🔍 <b>【Injective 链上地址资产查询】</b>
 
@@ -1321,7 +1517,8 @@ ${targetsLines}
 
 📊 <b>实时链上资产 (主账户 + 衍生品子账户)</b>:
 • <b>INJ 余额</b>: <code>${balances.inj} INJ</code>
-• <b>USDT/USDC 余额</b>: <code>${balances.usdt} USDT</code>
+• <b>USDT 余额</b>: <code>${balances.usdt} USDT</code>
+• <b>USDC 余额</b>: <code>${balances.usdc} USDC</code>
 • <b>总资产折合估值</b>: <b>~$${balances.totalUsd} USD</b>
       `.trim();
 
@@ -1333,31 +1530,37 @@ ${targetsLines}
       try {
         await ctx.editMessageText(inspectText, { parse_mode: 'HTML', reply_markup: keyboard });
       } catch {
-        await ctx.reply(inspectText, { parse_mode: 'HTML', reply_markup: keyboard });
+        await ctx.reply(inspectText, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
       }
     });
 
     this.bot.callbackQuery('toggle_mode_ratio', async (ctx) => {
-      this.config.copyMode = 'RATIO';
-      await ctx.answerCallbackQuery('已切换为仓位比例跟单模式');
+      const userId = ctx.from?.id || 0;
+      this.walletService.setUserCopyMode(userId, 'RATIO');
+      await ctx.answerCallbackQuery('已为您切换为：按巨鲸仓位比例跟单').catch(() => {});
       await this.renderMainMenu(ctx, true);
     });
 
     this.bot.callbackQuery('toggle_mode_fixed', async (ctx) => {
-      this.config.copyMode = 'FIXED_AMOUNT';
-      await ctx.answerCallbackQuery('已切换为固定金额跟单模式');
+      const userId = ctx.from?.id || 0;
+      this.walletService.setUserCopyMode(userId, 'FIXED_AMOUNT');
+      await ctx.answerCallbackQuery('已为您切换为：固定金额跟单').catch(() => {});
       await this.renderMainMenu(ctx, true);
     });
 
-    // 风控设置
+    // 风控设置 (完全按用户独立配置持久化，不篡改其他用户)
     this.bot.callbackQuery('view_risk', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      const copyState = this.walletService.getUserCopyState(userId);
+      const modeName = copyState.copyMode === 'RATIO' ? '按巨鲸比例' : '固定金额';
       const text = `
-🛡️ <b>【专业级智能风控设置】</b>
+🛡️ <b>【您的专属智能风控设置】</b>
 
-系统配备毫秒级链上风控防火墙，全方位保护您的本金安全：
-• <b>滑点保护阈值</b>: <b>${this.config.maxSlippagePercent}%</b> (当盘口剧烈跳空超阈值自动拦截)
-• <b>最大允许杠杆</b>: <b>${this.config.maxLeverage}x</b> (防止极端行情穿仓)
-• <b>单笔金额上限</b>: <b>$${this.config.maxNotionalPerOrder} USD</b>
+当前仅针对您个人账号生效，不会影响其他用户：
+• <b>跟单模式</b>: <b>${modeName}</b>
+• <b>滑点保护阈值</b>: <b>${copyState.maxSlippagePercent}%</b> (当盘口剧烈跳空超阈值自动拦截)
+• <b>最大允许杠杆</b>: <b>${copyState.maxLeverage}x</b> (防止极端行情穿仓)
+• <b>单笔金额上限</b>: <b>$${copyState.maxNotionalPerOrder} USD</b>
 • <b>行情异常熔断</b>: <b>已开启</b> (亚秒级判定)
       `.trim();
 
@@ -1370,22 +1573,28 @@ ${targetsLines}
         .text('杠杆 5x', 'lev_5')
         .text('杠杆 10x', 'lev_10')
         .row()
+        .text('固定金额模式', 'toggle_mode_fixed')
+        .text('按比例跟单模式', 'toggle_mode_ratio')
+        .row()
         .text('🔙 返回主菜单', 'back_to_menu');
 
-      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
+      await ctx.answerCallbackQuery().catch(() => {});
+      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
     });
 
     this.bot.callbackQuery(/^slip_(\d+)$/, async (ctx) => {
+      const userId = ctx.from?.id || 0;
       const v = parseInt(ctx.match[1], 10) / 10;
-      this.config.maxSlippagePercent = v;
-      await ctx.answerCallbackQuery(`滑点保护已更新为 ${v}%`);
+      this.walletService.setUserSlippage(userId, v);
+      await ctx.answerCallbackQuery(`您的专属滑点保护已更新为 ${v}%`).catch(() => {});
       await this.renderMainMenu(ctx, true);
     });
 
     this.bot.callbackQuery(/^lev_(\d+)$/, async (ctx) => {
+      const userId = ctx.from?.id || 0;
       const lev = parseInt(ctx.match[1], 10);
-      this.config.maxLeverage = lev;
-      await ctx.answerCallbackQuery(`最大杠杆已更新为 ${lev}x`);
+      this.walletService.setUserLeverage(userId, lev);
+      await ctx.answerCallbackQuery(`您的专属最大杠杆已更新为 ${lev}x`).catch(() => {});
       await this.renderMainMenu(ctx, true);
     });
 
@@ -1409,47 +1618,46 @@ ${targetsLines}
         .row()
         .text('🔙 返回主菜单', 'back_to_menu');
 
+      await ctx.answerCallbackQuery().catch(() => {});
       await ctx.editMessageText(text, {
         parse_mode: 'HTML',
         reply_markup: keyboard,
-      });
+      }).catch(() => {});
     });
 
     this.bot.callbackQuery(/^amt_(\d+)$/, async (ctx) => {
       const userId = ctx.from?.id || 0;
       const amt = parseInt(ctx.match[1], 10);
       this.walletService.setUserAmount(userId, amt);
-      this.config.fixedUsdtAmount = amt;
-      await ctx.answerCallbackQuery(`金额已更新为 $${amt} USDT`);
-      await ctx.editMessageText(`✅ 单笔跟单金额已成功设置为 <b>$${amt} USDT</b>！`, {
+      await ctx.answerCallbackQuery(`您的单笔金额已更新为 $${amt} USDT`).catch(() => {});
+      await ctx.editMessageText(`✅ 您的单笔跟单金额已成功设置为 <b>$${amt} USDT</b>！`, {
         parse_mode: 'HTML',
         reply_markup: new InlineKeyboard().text('🔙 返回主菜单', 'back_to_menu'),
-      });
+      }).catch(() => {});
     });
 
-    // 邀请返佣收益看板
-    this.bot.callbackQuery('view_referral', async (ctx) => {
-      const userId = ctx.from?.id || 888888;
-      const botName = this.bot?.botInfo?.username || 'injective_copy_bot';
+    const renderReferralView = async (ctx: any, userId: number, extraNotice?: string) => {
+      const botName = this.bot?.botInfo?.username || ctx.me?.username || 'injective_copy_bot';
       const refLink = `https://t.me/${botName}?start=ref_${userId}`;
       const stats = this.walletService.getReferralStats(userId);
 
+      const noticeLine = extraNotice ? `\n\n📌 <b>最新提现状态</b>: ${extraNotice}` : '';
       const text = `
 🎁 <b>Injective 裂变邀请返佣收益看板</b>
 
-邀请好友使用您的专属链接开启跟单，<b>终身享受好友产生交易手续费的 ${this.config.referralRewardPercent}% 现金分红！</b>
+邀请好友使用您的专属链接开启<b>实盘跟单</b>，<b>终身享受好友产生交易手续费的 ${this.config.referralRewardPercent}% 现金分红！</b>
 
 📊 <b>您的推广业绩统计:</b>
 • 👥 <b>成功邀请好友</b>: <b>${stats.invitedCount} 人</b>
-• 📈 <b>好友累计交易量</b>: <b>$${stats.volume.toLocaleString()} USDT</b>
+• 📈 <b>好友实盘累计交易量</b>: <b>$${stats.volume.toLocaleString()} USDT</b>
 • 💰 <b>历史累计总返佣</b>: <b>+$${stats.totalEarnings.toFixed(4)} USDT</b>
 • 💳 <b>当前可提现余额</b>: <b>$${stats.available.toFixed(4)} USDT</b>
-• 📤 <b>已成功提现金额</b>: <b>$${stats.withdrawn.toFixed(4)} USDT</b>
-
+• 📤 <b>已申请/已发放返佣</b>: <b>$${stats.withdrawn.toFixed(4)} USDT</b>
+${stats.pendingPayoutUsdt > 0 ? `• ⏳ <b>待链上发放总额</b>: <b>$${stats.pendingPayoutUsdt.toFixed(4)} USDT</b>\n` : ''}
 🔗 <b>您的专属推广链接:</b>
 <code>${refLink}</code>
 
-💡 <i>返佣资金由系统在好友每笔成交后实时自动累积记账，满 1.00 USDT 即可点击下方按钮秒提现至钱包！</i>
+💡 <i>返佣仅在好友真实链上成交后实时记账，满 1.00 USDT 即可点击下方按钮发起链上提现！</i>${noticeLine}
       `.trim();
 
       const keyboard = new InlineKeyboard()
@@ -1465,10 +1673,17 @@ ${targetsLines}
       await ctx.editMessageText(text, {
         parse_mode: 'HTML',
         reply_markup: keyboard,
-      });
+      }).catch(() => {});
+    };
+
+    // 邀请返佣收益看板
+    this.bot.callbackQuery('view_referral', async (ctx) => {
+      const userId = ctx.from?.id || 888888;
+      await ctx.answerCallbackQuery().catch(() => {});
+      await renderReferralView(ctx, userId);
     });
 
-    // 申请提现推广返佣
+    // 申请提现推广返佣 (支持链上真实发放或记录可审计待发单 + 通知管理员人工审核)
     this.bot.callbackQuery('withdraw_referral', async (ctx) => {
       const userId = ctx.from?.id || 0;
       const res = this.walletService.withdrawReferralRewards(userId);
@@ -1477,53 +1692,124 @@ ${targetsLines}
         return;
       }
 
-      await ctx.answerCallbackQuery({
-        text: `🎉 成功提现 $${res.amount.toFixed(2)} USDT！已直接划转至您的可用账户余额。`,
-        show_alert: true,
-      }).catch(() => {});
+      const autoPayoutEnabled = Boolean(
+        this.config.referralPayoutPrivateKey &&
+          process.env.BLOCK_USER_REAL_TRADES !== 'true' &&
+          res.payoutId
+      );
 
-      // 重新渲染返佣看板最新数据
-      const botName = this.bot?.botInfo?.username || 'injective_copy_bot';
-      const refLink = `https://t.me/${botName}?start=ref_${userId}`;
-      const stats = this.walletService.getReferralStats(userId);
-      const text = `
-🎁 <b>Injective 裂变邀请返佣收益看板</b>
+      if (autoPayoutEnabled) {
+        await ctx.answerCallbackQuery('⏳ 正在向您的钱包发起链上返佣打款...').catch(() => {});
+      }
 
-邀请好友使用您的专属链接开启跟单，<b>终身享受好友产生交易手续费的 ${this.config.referralRewardPercent}% 现金分红！</b>
+      let statusNote = `提现单 <code>${res.payoutId}</code> 已提交，等待管理员审核后向 <code>${res.wallet.injectiveAddress}</code> 发放。`;
+      let alertMsg = `✅ 已提交 $${res.amount.toFixed(2)} USDT 返佣提现申请 (${res.payoutId})，已通知管理员审核打款！`;
 
-📊 <b>您的推广业绩统计:</b>
-• 👥 <b>成功邀请好友</b>: <b>${stats.invitedCount} 人</b>
-• 📈 <b>好友累计交易量</b>: <b>$${stats.volume.toLocaleString()} USDT</b>
-• 💰 <b>历史累计总返佣</b>: <b>+$${stats.totalEarnings.toFixed(4)} USDT</b>
-• 💳 <b>当前可提现余额</b>: <b>$${stats.available.toFixed(4)} USDT</b>
-• 📤 <b>已成功提现金额</b>: <b>$${stats.withdrawn.toFixed(4)} USDT</b>
+      if (autoPayoutEnabled && res.payoutId) {
+        try {
+          const payoutDenom =
+            process.env.REFERRAL_PAYOUT_DENOM ||
+            'peggy0xdAC17F958D2ee523a2206206994597C13D831ec7';
+          const txHash = await this.copyEngine
+            .getInjectiveService()
+            .sendBankToken(
+              this.config.referralPayoutPrivateKey!,
+              res.wallet.injectiveAddress,
+              payoutDenom,
+              res.amount,
+              6
+            );
+          this.walletService.markReferralPayoutPaid(userId, res.payoutId, txHash);
+          statusNote = `🎉 已真实链上打款！Tx: <a href="https://injscan.com/transaction/${txHash}">${txHash}</a>`;
+          await renderReferralView(ctx, userId, statusNote);
+          return;
+        } catch (err: any) {
+          console.warn('[TelegramBot] 返佣自动链上打款异常，保留待处理打款单:', err.message);
+          statusNote = `⏳ 自动打款异常 (${err.message || '网络繁忙'})，提现单 <code>${res.payoutId}</code> 已保留待人工核发。`;
+          await renderReferralView(ctx, userId, statusNote);
+          return;
+        }
+      }
 
-🔗 <b>您的专属推广链接:</b>
-<code>${refLink}</code>
+      // 通知管理员有新的返佣提现申请待发放
+      if (this.bot && this.config.adminTelegramIds && this.config.adminTelegramIds.length > 0) {
+        const adminMsg = `
+💸 <b>【新返佣提现申请通知】</b>
 
-💡 <i>返佣资金由系统在好友每笔成交后实时自动累积记账，满 1.00 USDT 即可点击下方按钮秒提现至钱包！</i>
-      `.trim();
+• <b>提现单号</b>: <code>${res.payoutId}</code>
+• <b>申请人</b>: @${ctx.from?.username || userId} (<code>${userId}</code>)
+• <b>提现金额</b>: <b>$${res.amount.toFixed(4)} USDT</b>
+• <b>收款地址</b>: <code>${res.wallet.injectiveAddress}</code>
+        `.trim();
+        for (const adminId of this.config.adminTelegramIds) {
+          await this.bot.api.sendMessage(adminId, adminMsg, { parse_mode: 'HTML' }).catch(() => {});
+        }
+      }
 
-      const keyboard = new InlineKeyboard()
-        .text('💳 立即提取返佣收益 (满1U可提)', 'withdraw_referral')
-        .row()
-        .url(
-          '🚀 转发到 Telegram 群/好友',
-          `https://t.me/share/url?url=${encodeURIComponent(refLink)}&text=${encodeURIComponent('Injective 链上实盘聪明钱巨鲸自动跟单神器，点此开启挂机跟单！')}`
-        )
-        .row()
-        .text('🔙 返回主菜单', 'back_to_menu');
-
-      await ctx.editMessageText(text, {
-        parse_mode: 'HTML',
-        reply_markup: keyboard,
-      }).catch(() => {});
+      await ctx.answerCallbackQuery({ text: alertMsg, show_alert: true }).catch(() => {});
+      await renderReferralView(ctx, userId, statusNote);
     });
 
     // 实时盈亏与战绩看板
     this.bot.callbackQuery('view_stats', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      if (this.isRpcRateLimited(userId, 'view_stats', 2500)) {
+        await ctx.answerCallbackQuery('⏳ 请稍候再刷新').catch(() => {});
+        return;
+      }
       await ctx.answerCallbackQuery('正在刷新实时行情与浮盈...').catch(() => {});
       await this.renderPortfolioAndStats(ctx, true);
+    });
+
+    // 一键市价全平实盘链上持仓
+    this.bot.callbackQuery('close_all_real_pos', async (ctx) => {
+      const userId = ctx.from?.id || 0;
+      const userWallet = this.walletService.getOrCreateWallet(userId);
+      if (userWallet.decryptionError) {
+        await ctx.answerCallbackQuery({ text: '⚠️ 钱包解密异常，请联系管理员检查密钥配置', show_alert: true }).catch(() => {});
+        return;
+      }
+      if (process.env.BLOCK_USER_REAL_TRADES === 'true') {
+        await ctx.answerCallbackQuery({ text: '⚠️ 管理员已暂停实盘下单广播', show_alert: true }).catch(() => {});
+        return;
+      }
+      await ctx.answerCallbackQuery('正在向 Injective 主网发送市价平仓指令...').catch(() => {});
+      const injService = this.copyEngine.getInjectiveService();
+      const copyState = this.walletService.getUserCopyState(userId);
+
+      try {
+        const positions = await injService.getSubaccountPositions(userWallet.subaccountId);
+        let closed = 0;
+        let failed = 0;
+        for (const pos of positions) {
+          try {
+            const ob = await injService.getOrderbookPrices(pos.marketId);
+            const closeDir = pos.direction === 'long' ? 'SELL' : 'BUY';
+            const basePrice = closeDir === 'BUY' ? (ob.bestAsk || pos.markPrice) : (ob.bestBid || pos.markPrice);
+            const slip = (copyState.maxSlippagePercent || 1.5) / 100;
+            const protPrice = closeDir === 'BUY' ? basePrice * (1 + slip) : basePrice * Math.max(0.01, 1 - slip);
+
+            await injService.executeUserRealMarketOrder(userWallet.privateKeyHex, {
+              marketId: pos.marketId,
+              direction: closeDir,
+              quantity: pos.quantity,
+              price: protPrice,
+              fillPrice: basePrice,
+              leverage: 1,
+              isReduceOnly: true,
+            });
+            this.walletService.clearRealPositionOwners(userId, pos.marketId);
+            closed += 1;
+          } catch (e: any) {
+            failed += 1;
+            console.warn(`[TelegramBot] 实盘平仓失败 (${pos.ticker}):`, e.message);
+          }
+        }
+        await ctx.reply(`⚡ 实盘平仓执行完毕：成功 ${closed} 笔${failed > 0 ? `，失败 ${failed} 笔` : ''}。`).catch(() => {});
+      } catch (err: any) {
+        await ctx.reply(`⚠️ 查询实盘持仓失败: ${err.message}`).catch(() => {});
+      }
+      await this.renderPortfolioAndStats(ctx, false);
     });
 
     // 一键市价全平模拟持仓
@@ -1615,6 +1901,7 @@ ${targetsLines}
     this.bot.callbackQuery(/^follow_(.+)$/, async (ctx) => {
       const targetParam = ctx.match[1];
       let targetAddress = '';
+      let subaccountIndex = 0;
 
       if (targetParam.startsWith('custom_')) {
         targetAddress = targetParam.replace('custom_', '');
@@ -1622,6 +1909,7 @@ ${targetsLines}
         const whale = this.leaderboard.getWhaleById(targetParam);
         if (whale) {
           targetAddress = whale.address;
+          subaccountIndex = whale.subaccountIndex ?? 0;
         } else if (targetParam.startsWith('inj1')) {
           targetAddress = targetParam;
         }
@@ -1632,7 +1920,7 @@ ${targetsLines}
         return;
       }
 
-      await this.applyFollowTarget(ctx, targetAddress, true);
+      await this.applyFollowTarget(ctx, targetAddress, true, subaccountIndex);
     });
   }
 
@@ -1663,7 +1951,7 @@ ${targetLines}
 
 • <b>执行引擎模式</b>: <b>${modeBadge}</b>
 • <b>单笔跟单金额</b>: <b>$${userCopy.copyAmountUsdt} USDT</b>
-• <b>滑点保护阈值</b>: <b>${this.config.maxSlippagePercent}%</b> (超标自动拦截)
+• <b>滑点保护阈值</b>: <b>${userCopy.maxSlippagePercent}%</b> | <b>最大杠杆</b>: <b>${userCopy.maxLeverage}x</b>
 
 ⚡ <i>多巨鲸并发监听已就绪！以上任意一位巨鲸在 Injective 链上开仓或加仓，系统均将毫秒级为您同步执行跟单，互不覆盖！</i>
     `.trim();
@@ -1690,13 +1978,18 @@ ${targetLines}
       } catch (e) {}
     }
 
-    await ctx.reply(confirmText, { parse_mode: 'HTML', reply_markup: keyboard });
+    await ctx.reply(confirmText, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
   }
 
   /**
    * 将目标加入用户的多巨鲸跟单矩阵并校验资金
    */
-  private async applyFollowTarget(ctx: any, targetAddress: string, isCallback: boolean = false) {
+  private async applyFollowTarget(
+    ctx: any,
+    targetAddress: string,
+    isCallback: boolean = false,
+    subaccountIndex: number = 0
+  ) {
     const userId = ctx.from?.id || 0;
 
     // 做市商与高频刷量机器人防御拦截：绝对禁止用户选到做市商跟单
@@ -1723,24 +2016,26 @@ ${targetLines}
       if (isCallback) {
         await ctx.answerCallbackQuery({ text: '⚠️ 拦截：该地址为做市商程序，已拒绝跟单！', show_alert: true }).catch(() => {});
         await ctx.editMessageText(alertText, { parse_mode: 'HTML', reply_markup: keyboard }).catch(async () => {
-          await ctx.reply(alertText, { parse_mode: 'HTML', reply_markup: keyboard });
+          await ctx.reply(alertText, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
         });
       } else {
-        await ctx.reply(alertText, { parse_mode: 'HTML', reply_markup: keyboard });
+        await ctx.reply(alertText, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
       }
       return;
     }
 
     const userWallet = this.walletService.getOrCreateWallet(userId, ctx.from?.username);
-    const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress);
+    const injPrice = await this.getLiveInjPrice();
+    const balances = await this.walletService.getRealBalances(userWallet.injectiveAddress, injPrice);
     const isPractice = this.walletService.isPracticeMode(userId);
-    const hasRealFunds = parseFloat(balances.usdt) > 0 || parseFloat(balances.inj) > 0;
+    const hasRealFunds = parseFloat(balances.stableUsd) > 0 || parseFloat(balances.inj) > 0;
 
     const whale = this.leaderboard.getWhaleByAddress(targetAddress);
+    const effectiveSubIdx = whale?.subaccountIndex ?? subaccountIndex;
     const name = whale ? `${whale.name} ${whale.badge}` : `自定义巨鲸 0x${targetAddress.slice(-4)}`;
 
-    // 加入用户的多巨鲸跟单列表 (绝不覆盖已有巨鲸)
-    const { targets } = this.walletService.addUserTarget(userId, targetAddress, name);
+    // 加入用户的多巨鲸跟单列表 (绝不覆盖已有巨鲸，保留真实子账户序号)
+    const { targets } = this.walletService.addUserTarget(userId, targetAddress, name, effectiveSubIdx);
 
     // 零余额处理逻辑: 如果实盘无资金且未激活体验金，引导清晰二选一选择
     if (!hasRealFunds && !isPractice) {
@@ -1753,9 +2048,8 @@ ${targetLines}
 
     // 激活多巨鲸并发监听
     this.walletService.setUserCopying(userId, true);
-    this.config.targetTraderAddress = targetAddress;
     for (const t of targets) {
-      await this.tracker.addTrackedTrader(t.address);
+      await this.tracker.addTrackedTrader(t.address, t.subaccountIndex ?? 0);
     }
     this.leaderboard.registerCustomWhale(targetAddress);
 
@@ -1786,7 +2080,7 @@ ${check.error || '输入的地址格式不正确'}
         .text('🔍 重新输入地址', 'track_custom_wallet')
         .text('🔙 返回主菜单', 'back_to_menu');
 
-      await ctx.reply(errText, { parse_mode: 'HTML', reply_markup: keyboard });
+      await ctx.reply(errText, { parse_mode: 'HTML', reply_markup: keyboard }).catch(() => {});
       return;
     }
 
@@ -1813,65 +2107,147 @@ ${check.error || '输入的地址格式不正确'}
   }
 
   /**
-   * 根据用户自己设置的 copyAmountUsdt 折算专属下单数量与所需保证金
+   * 按用户专属风控参数折算下单数量、滑点保护上限价与所需保证金
    */
-  public calculateUserOrderSizing(userId: number, result: CopyOrderResult) {
+  public calculateUserOrderSizing(
+    userId: number,
+    result: CopyOrderResult,
+    event?: SmartMoneyTradeEvent
+  ) {
     const userWallet = this.walletService.getOrCreateWallet(userId);
-    const userAmountUsdt = userWallet.copyAmountUsdt || this.config.fixedUsdtAmount || 100;
-    const execPrice = Number(result.executionPrice || 0);
-    const leverage = result.leverage || 1;
+    const copyState = this.walletService.getUserCopyState(userId);
     const injService = this.copyEngine.getInjectiveService();
-    const market = injService.getMarketByTicker(result.marketTicker);
-    const tickSize = market?.minQuantityTickSize || 0.001;
-    const precision = Math.max(0, -Math.floor(Math.log10(tickSize)));
+    const market =
+      (result.marketId ? injService.getMarket(result.marketId) : undefined) ||
+      injService.getMarketByTicker(result.marketTicker);
 
-    const rawQty = execPrice > 0 ? userAmountUsdt / execPrice : Number(result.executedQuantity || 0);
-    const userQuantity = Math.max(
-      tickSize,
-      Number((Math.floor(rawQty / tickSize) * tickSize).toFixed(precision))
-    );
+    const execPrice = Number(result.executionPrice || 0);
+    const userAmountUsdt = copyState.copyAmountUsdt;
+
+    if (market && event) {
+      const riskEval = this.copyEngine.getRiskManager().evaluate({
+        event,
+        market,
+        currentMidPrice: result.currentMidPrice || execPrice,
+        currentAsk: result.currentAsk,
+        currentBid: result.currentBid,
+        userRiskConfig: {
+          copyMode: copyState.copyMode,
+          fixedUsdtAmount: copyState.copyAmountUsdt,
+          copyRatio: copyState.copyRatio,
+          maxSlippagePercent: copyState.maxSlippagePercent,
+          maxNotionalPerOrder: copyState.maxNotionalPerOrder,
+          maxLeverage: copyState.maxLeverage,
+        },
+      });
+
+      return {
+        passed: riskEval.passed,
+        reason: riskEval.reason,
+        userWallet,
+        userAmountUsdt,
+        userQuantity: riskEval.adjustedQuantity,
+        userMargin: riskEval.calculatedMargin,
+        execPrice: riskEval.fillPrice || execPrice,
+        protectionPrice: riskEval.adjustedPrice,
+        leverage: riskEval.leverage,
+        market,
+      };
+    }
+
+    const leverage = Math.min(copyState.maxLeverage || result.leverage || 1, 20);
+    const tickSize = market?.minQuantityTickSize || 0.001;
+    const precision = Math.max(0, Math.min(8, -Math.floor(Math.log10(tickSize))));
+    const targetNotional =
+      copyState.copyMode === 'RATIO' && event
+        ? Math.min(event.notionalUsd * copyState.copyRatio, copyState.maxNotionalPerOrder)
+        : Math.min(userAmountUsdt, copyState.maxNotionalPerOrder);
+
+    const rawQty = execPrice > 0 ? targetNotional / execPrice : Number(result.executedQuantity || 0);
+    const userQuantity = Number((Math.floor(rawQty / tickSize) * tickSize).toFixed(precision));
+
+    if (userQuantity < tickSize || userQuantity <= 0) {
+      return {
+        passed: false,
+        reason: `折算数量 ${userQuantity} 低于市场最小下单单位 ${tickSize}`,
+        userWallet,
+        userAmountUsdt,
+        userQuantity: 0,
+        userMargin: 0,
+        execPrice,
+        protectionPrice: result.protectionPrice || execPrice,
+        leverage,
+        market,
+      };
+    }
+
     const userMargin = Number(((userQuantity * execPrice) / leverage).toFixed(4));
+    const slip = (copyState.maxSlippagePercent || this.config.maxSlippagePercent || 1.5) / 100;
+    const rawProt =
+      result.direction === 'BUY' ? execPrice * (1 + slip) : execPrice * Math.max(0.01, 1 - slip);
 
     return {
+      passed: true,
       userWallet,
       userAmountUsdt,
       userQuantity,
       userMargin,
       execPrice,
+      protectionPrice: result.protectionPrice || rawProt,
       leverage,
       market,
     };
   }
 
   /**
-   * 向已跟单该巨鲸的目标用户及广播频道推送聪明钱开仓信号
+   * 向广播频道/群组推送高质量大额聪明钱异动 (过滤小额 TWAP 拆单与 5 分钟内重复推送)
    */
   public async broadcastSignal(event: SmartMoneyTradeEvent) {
+    if (!this.bot || !this.config.telegramBroadcastChatId) return;
+
+    const minChannelNotional = this.config.channelMinNotionalUsd ?? 1000;
+    if (event.notionalUsd < minChannelNotional) {
+      return;
+    }
+
+    const nowMs = Date.now();
+    const channelKey = `${event.traderAddress.toLowerCase()}_${event.marketId}_${event.direction}`;
+    const lastSent = this.channelBroadcastCooldowns.get(channelKey) || 0;
+    if (nowMs - lastSent < 300_000) {
+      return;
+    }
+    this.channelBroadcastCooldowns.set(channelKey, nowMs);
+    if (this.channelBroadcastCooldowns.size > 2000) {
+      for (const [k, ts] of this.channelBroadcastCooldowns.entries()) {
+        if (nowMs - ts > 600_000) this.channelBroadcastCooldowns.delete(k);
+      }
+    }
+
     const isBuy = event.direction === 'BUY';
     const text = `
-🚨 <b>【Injective 链上巨鲸开仓异动】</b>
+🚨 <b>【Injective 链上巨鲸大额异动】</b>
 
 • <b>标的资产</b>: <code>${event.marketTicker}</code>
 • <b>操作方向</b>: ${isBuy ? '🟢 做多 (LONG)' : '🔴 做空 (SHORT)'}
 • <b>成交价格</b>: <b>$${event.price}</b>
-• <b>大户仓位</b>: <b>${event.quantity}</b> (约 <b>$${event.notionalUsd.toFixed(2)}</b>)
+• <b>大户仓位</b>: <b>${event.quantity}</b> (约 <b>$${event.notionalUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}</b>)
 • <b>巨鲸地址</b>: <code>${event.traderAddress.substring(0, 8)}...${event.traderAddress.slice(-6)}</code>
 
-⚡ <i>云端多巨鲸跟单引擎已就绪，正在按您的专属仓位执行风控核算...</i>
+⚡ <i>大额实时异动信号，点击下方按钮可一键跟随该巨鲸！</i>
     `.trim();
 
-    // 仅向公开广播频道推送开仓异动，避免向个人重复轰炸“开仓前预告 + 开仓后成交”两遍导致 1.2K 消息刷屏
-    if (this.bot && this.config.telegramBroadcastChatId) {
-      try {
-        await this.bot.api.sendMessage(this.config.telegramBroadcastChatId, text, {
-          parse_mode: 'HTML',
-          reply_markup: new InlineKeyboard().url(
-            '⚡ 立即一键跟单',
-            `https://t.me/${this.bot.botInfo?.username || ''}`
-          ),
-        });
-      } catch (e) {}
-    }
+    try {
+      const kb = this.bot.botInfo?.username
+        ? new InlineKeyboard().url(
+            `⚡ 一键跟单 (${isBuy ? '做多' : '做空'})`,
+            `https://t.me/${this.bot.botInfo.username}?start=follow_${event.traderAddress}`
+          )
+        : undefined;
+      await this.bot.api.sendMessage(this.config.telegramBroadcastChatId, text, {
+        parse_mode: 'HTML',
+        reply_markup: kb,
+      });
+    } catch (e) {}
   }
 
   /**
@@ -1885,16 +2261,18 @@ ${check.error || '输入的地址格式不正确'}
       paperOrderId?: string;
       userQuantity?: number;
       userMargin?: number;
+      leverage?: number;
       insufficientRealBalance?: { inj: string; usdt: string; requiredMargin: number; userAmountUsdt: number };
       realBroadcastError?: string;
+      customBlockedReason?: string;
     }
   ): string {
-    if (!result.success) {
+    if (!result.success || options?.customBlockedReason) {
       return `
 🛑 <b>【跟单已安全拦截（风控保护生效）】</b>
 
 • 市场: <code>${result.marketTicker}</code>
-• 拦截原因: <i>${result.error}</i>
+• 拦截原因: <i>${options?.customBlockedReason || result.error}</i>
 • 您的资金不受任何影响，已成功规避潜在亏损！
       `.trim();
     }
@@ -1904,6 +2282,7 @@ ${check.error || '输入的地址格式不正确'}
     const isPrac = !!userWallet.practiceMode;
     const finalQty = options?.userQuantity ?? sizing.userQuantity;
     const finalMargin = options?.userMargin ?? sizing.userMargin;
+    const finalLeverage = options?.leverage ?? sizing.leverage;
 
     if (isPrac) {
       const positionsCount = (userWallet.practicePositions || []).length;
@@ -1919,7 +2298,7 @@ ${check.error || '输入的地址格式不正确'}
 • <b>执行模式</b>: <i>【🧪 模拟盘演练 (虚拟体验金扣款，不上链不耗 Gas)】</i>
 • <b>交易市场</b>: <code>${result.marketTicker}</code> | 方向: <b>${result.direction}</b>
 • <b>模拟成交价</b>: <b>$${result.executionPrice}</b> | 专属数量: <b>${finalQty}</b>
-• <b>扣除虚拟保证金</b>: <b>$${finalMargin.toFixed(2)} USDT</b> (${result.leverage}x 杠杆)
+• <b>扣除虚拟保证金</b>: <b>$${finalMargin.toFixed(2)} USDT</b> (${finalLeverage}x 杠杆)
 • <b>剩余可用体验金</b>: <b>$${availBal} USDT</b> (当前模拟持仓 ${positionsCount} 笔)
 • <b>模拟撮合流水号</b>: <code>${paperId} (未上链)</code>
       `.trim();
@@ -1932,10 +2311,10 @@ ${check.error || '输入的地址格式不正确'}
 
 • <b>当前模式</b>: <b>🔴 实盘链上交易模式</b>
 • <b>触发标的</b>: <code>${result.marketTicker}</code> | 方向: <b>${result.direction}</b>
-• <b>本单所需保证金</b>: <b>$${info.requiredMargin.toFixed(2)} USDT</b> (按您设置的 $${info.userAmountUsdt} USDT/单折算)
-• <b>您的当前实盘余额</b>: <b>${info.inj} INJ / ${info.usdt} USDT</b>
+• <b>本单所需保证金</b>: <b>$${info.requiredMargin.toFixed(2)}</b> (按您设置的 $${info.userAmountUsdt} USDT/单折算)
+• <b>您的当前实盘余额</b>: <b>${info.inj} INJ / ${info.usdt}</b>
 
-💡 <i>实盘链上跟单需要您专属钱包内有充足的 USDT 保证金与少量 INJ (Gas 费)。系统已安全跳过本次链上广播，绝不虚报成交！请先充值或一键切换为 $10,000 模拟盘演练：</i>
+💡 <i>实盘链上跟单需要您专属钱包内有充足的对应合约保证金与少量 INJ (Gas 费)。系统已安全跳过本次链上广播，绝不虚报成交！请先充值或一键切换为 $10,000 模拟盘演练：</i>
       `.trim();
     }
 
@@ -1972,38 +2351,48 @@ ${check.error || '输入的地址格式不正确'}
 • <b>签名地址</b>: <code>${userWallet.injectiveAddress}</code>
 • <b>交易市场</b>: <code>${result.marketTicker}</code> | 方向: <b>${result.direction}</b>
 • <b>实盘成交价</b>: <b>$${result.executionPrice}</b> | 专属数量: <b>${finalQty}</b>
-• <b>实盘占用保证金</b>: <b>$${finalMargin.toFixed(2)} USDT</b> (${result.leverage}x 杠杆)
+• <b>实盘占用保证金</b>: <b>$${finalMargin.toFixed(2)} USDT</b> (${finalLeverage}x 杠杆)
 • <b>链上广播耗时</b>: <b>${result.executionTimeMs} ms</b>
 • <b>主网交易哈希</b>: ${txLink}
     `.trim();
   }
 
   /**
-   * 推送跟单结果：仅针对已开启跟单且匹配该巨鲸的目标用户，按其专属 copyAmountUsdt 折算并严格区分模拟盘与实盘
+   * 推送跟单结果：仅针对已开启跟单且匹配该巨鲸的目标用户，按其专属风控与金额折算并分批并发执行
    */
   public async notifyCopyTradeResult(result: CopyOrderResult, event?: SmartMoneyTradeEvent) {
     const matchedFollowers = this.getMatchedFollowerWallets(event?.traderAddress);
     if (matchedFollowers.length === 0) return;
 
     const injService = this.copyEngine.getInjectiveService();
+    const injPrice = await this.getLiveInjPrice();
 
-    for (const w of matchedFollowers) {
+    const processUser = async (w: ReturnType<typeof this.getMatchedFollowerWallets>[number]) => {
       const chatId = w.telegramId;
-      if (!result.success) {
-        const blockedText = this.formatTradeNotificationText(chatId, result);
+      const sizing = this.calculateUserOrderSizing(chatId, result, event);
+
+      if (!sizing.passed) {
+        const blockedText = this.formatTradeNotificationText(chatId, result, {
+          customBlockedReason: sizing.reason || result.error || '未通过个人风控检查',
+        });
         if (this.bot) {
-          try {
-            await this.bot.api.sendMessage(chatId, blockedText, { parse_mode: 'HTML' });
-          } catch (e) {}
+          await this.bot.api.sendMessage(chatId, blockedText, { parse_mode: 'HTML' }).catch(() => {});
         }
-        continue;
+        return;
       }
 
-      const sizing = this.calculateUserOrderSizing(chatId, result);
+      // 使用用户个人风控校验通过后的有效结果对象，避免全局风控未通过覆盖已通过用户的通知模板
+      const effectiveResult: CopyOrderResult = {
+        ...result,
+        success: true,
+        executionPrice: sizing.execPrice,
+        leverage: sizing.leverage,
+      };
 
       if (w.practiceMode) {
-        // 1. 模拟盘演练模式：按用户自己的 copyAmountUsdt 折算出的 userQuantity 和 userMargin 真实扣减体验金
+        // 1. 模拟盘演练模式：扣减虚拟体验金（严禁在模拟盘累计真实推荐返佣！）
         const pracRes = this.walletService.executePracticeTrade(chatId, {
+          marketId: sizing.market?.marketId || result.marketId,
           marketTicker: result.marketTicker,
           direction: result.direction,
           price: sizing.execPrice,
@@ -2013,123 +2402,222 @@ ${check.error || '输入的地址格式不正确'}
           traderAddress: event?.traderAddress,
         });
 
+        if (pracRes.action === 'SKIPPED') {
+          return;
+        }
+
         const text = pracRes.success
-          ? this.formatTradeNotificationText(chatId, result, {
+          ? this.formatTradeNotificationText(chatId, effectiveResult, {
               userQuantity: sizing.userQuantity,
               userMargin: sizing.userMargin,
+              leverage: sizing.leverage,
             })
           : `⚠️ <b>【模拟盘跟单未执行】</b>\n\n• 原因: <i>${pracRes.error}</i>`;
 
-        // 好友跟单裂变返佣自动结算与到账记账
-        if (pracRes.success) {
-          const tradeNotional = sizing.userQuantity * sizing.execPrice;
-          const refRes = this.walletService.recordReferralReward(chatId, tradeNotional);
-          if (refRes && refRes.rewardUsdt >= 0.0001 && this.bot) {
-            try {
-              await this.bot.api.sendMessage(
-                refRes.referrerId,
-                `💰 <b>【好友跟单返佣到账】</b>\n\n• 来自好友: @${w.username || chatId}\n• 本单产生返佣: <b>+$${refRes.rewardUsdt.toFixed(4)} USDT</b>\n• 您的累计总返佣: <b>$${refRes.totalEarned.toFixed(2)} USDT</b>\n\n👉 <i>随时点击主菜单【🎁 邀请返佣】查看明细与申请提现！</i>`,
-                { parse_mode: 'HTML' }
-              );
-            } catch (e) {}
-          }
-        }
-
-        // 消息限流防刷屏控制：30 秒内最多发送 1 条成交详情推送，避免高频巨鲸刷屏上千条消息打扰用户
+        // 消息限流防刷屏控制：30 秒内最多发送 1 条成交详情推送
         const now = Date.now();
         const lastNotice = this.lastUserNotificationTime.get(chatId) || 0;
         if (now - lastNotice >= 30_000) {
           this.lastUserNotificationTime.set(chatId, now);
           if (this.bot) {
-            try {
-              await this.bot.api.sendMessage(chatId, text, {
+            await this.bot.api
+              .sendMessage(chatId, text, {
                 parse_mode: 'HTML',
                 link_preview_options: { is_disabled: true },
-              });
-            } catch (e) {}
+              })
+              .catch(() => {});
           }
         }
-      } else {
-        // 2. 实盘链上交易模式：严禁谎报成功！必须先校验用户实盘 USDT 保证金与 INJ Gas 余额
-        const balances = await this.walletService.getRealBalances(w.injectiveAddress);
-        const usdtBal = parseFloat(balances.usdt);
-        const injBal = parseFloat(balances.inj);
+        return;
+      }
 
-        if (usdtBal < sizing.userMargin || injBal <= 0.001 || !sizing.market) {
-          const warnText = this.formatTradeNotificationText(chatId, result, {
-            insufficientRealBalance: {
-              inj: balances.inj,
-              usdt: balances.usdt,
-              requiredMargin: sizing.userMargin,
-              userAmountUsdt: sizing.userAmountUsdt,
-            },
-          });
-          const warnKb = new InlineKeyboard()
-            .text('💳 立即充值激活', 'deposit_guide')
-            .text('🧪 一键切换为模拟盘跟单', 'switch_mode_practice')
-            .row()
-            .text('🔙 返回主菜单', 'back_to_menu');
-
-          if (this.bot) {
-            try {
-              await this.bot.api.sendMessage(chatId, warnText, {
-                parse_mode: 'HTML',
-                reply_markup: warnKb,
-              });
-            } catch (e) {}
-          }
-          continue;
+      // 2. 实盘链上交易模式
+      if (process.env.BLOCK_USER_REAL_TRADES === 'true') {
+        if (this.bot) {
+          await this.bot.api
+            .sendMessage(
+              chatId,
+              `⏸️ <b>【实盘广播暂已暂停】</b>\n\n已捕获信号 <code>${result.marketTicker}</code> (${result.direction})，管理员当前已开启实盘拦截开关。`,
+              { parse_mode: 'HTML' }
+            )
+            .catch(() => {});
         }
+        return;
+      }
 
-        // 实盘余额充足：使用用户自己的私钥签名广播上链
+      if (w.decryptionError) {
+        if (this.bot) {
+          await this.bot.api
+            .sendMessage(
+              chatId,
+              `⚠️ <b>【实盘签名失败】</b> 您的本地钱包密钥解密异常，请联系管理员检查服务器密钥配置或重新导入钱包。`,
+              { parse_mode: 'HTML' }
+            )
+            .catch(() => {});
+        }
+        return;
+      }
+
+      const balances = await this.walletService.getRealBalances(w.injectiveAddress, injPrice);
+      const injBal = parseFloat(balances.inj);
+      const quoteDenom = sizing.market?.quoteDenom || '';
+      const exactQuoteBal =
+        quoteDenom && balances.denomTotals[quoteDenom] !== undefined
+          ? balances.denomTotals[quoteDenom]
+          : sizing.market?.ticker?.toUpperCase().includes('USDC')
+          ? parseFloat(balances.usdc)
+          : parseFloat(balances.usdt);
+
+      // 查询用户当前链上是否已持有反向仓位（若为反向平仓/减仓，使用 reduceOnly 无需追加保证金；同时检查多巨鲸方向冲突）
+      let existingOppositePos: Awaited<ReturnType<typeof injService.getSubaccountPositions>>[number] | undefined;
+      if (sizing.market) {
         try {
-          const realOrder = await injService.executeUserRealMarketOrder(w.privateKeyHex, {
-            marketId: sizing.market.marketId,
-            direction: result.direction,
-            quantity: sizing.userQuantity,
-            price: sizing.execPrice,
-            leverage: sizing.leverage,
-          });
-
-          const text = this.formatTradeNotificationText(chatId, result, {
-            realTxHash: realOrder.txHash,
-            userQuantity: sizing.userQuantity,
-            userMargin: sizing.userMargin,
-          });
-
-          // 好友实盘跟单裂变返佣自动结算与到账记账
-          const tradeNotional = sizing.userQuantity * sizing.execPrice;
-          const refRes = this.walletService.recordReferralReward(chatId, tradeNotional);
-          if (refRes && refRes.rewardUsdt >= 0.0001 && this.bot) {
-            try {
-              await this.bot.api.sendMessage(
-                refRes.referrerId,
-                `💰 <b>【好友实盘跟单返佣到账】</b>\n\n• 来自好友: @${w.username || chatId}\n• 本单产生返佣: <b>+$${refRes.rewardUsdt.toFixed(4)} USDT</b>\n• 您的累计总返佣: <b>$${refRes.totalEarned.toFixed(2)} USDT</b>\n\n👉 <i>随时点击主菜单【🎁 邀请返佣】查看明细与申请提现！</i>`,
-                { parse_mode: 'HTML' }
-              );
-            } catch (e) {}
+          const openPositions = await injService.getSubaccountPositions(w.subaccountId);
+          existingOppositePos = openPositions.find(
+            (p) =>
+              p.marketId === sizing.market!.marketId &&
+              ((result.direction === 'SELL' && p.direction === 'long') ||
+                (result.direction === 'BUY' && p.direction === 'short'))
+          );
+          if (!openPositions.some((p) => p.marketId === sizing.market!.marketId)) {
+            this.walletService.clearRealPositionOwners(chatId, sizing.market.marketId);
           }
-
-          if (this.bot) {
-            try {
-              await this.bot.api.sendMessage(chatId, text, {
-                parse_mode: 'HTML',
-                link_preview_options: { is_disabled: true },
-              });
-            } catch (e) {}
-          }
-        } catch (err: any) {
-          console.warn(`[TelegramBot] 用户 ${chatId} 实盘广播异常:`, err.message);
-          const errText = this.formatTradeNotificationText(chatId, result, {
-            realBroadcastError: err.message || String(err),
-          });
-          if (this.bot) {
-            try {
-              await this.bot.api.sendMessage(chatId, errText, { parse_mode: 'HTML' });
-            } catch (e) {}
-          }
+        } catch {
+          // ignore query failure and fall back to normal margin check
         }
       }
+
+      const isReduceOnly = Boolean(existingOppositePos && existingOppositePos.quantity > 0);
+      if (isReduceOnly && sizing.market && event?.traderAddress) {
+        const conflictCheck = this.walletService.checkRealPositionConflict(
+          chatId,
+          sizing.market.marketId,
+          result.direction,
+          event.traderAddress
+        );
+        if (conflictCheck.conflict) {
+          const ownerTag = conflictCheck.ownerAddresses.map((a) => `0x${a.slice(-4)}`).join(', ');
+          if (this.bot) {
+            await this.bot.api
+              .sendMessage(
+                chatId,
+                `🛡️ <b>【多巨鲸方向冲突保护】</b>\n\n• <b>合约</b>: <code>${result.marketTicker}</code>\n• <b>拦截原因</b>: 您当前实盘持仓归属于巨鲸 <code>${ownerTag}</code>，已安全拦截来自巨鲸 <code>0x${event.traderAddress.slice(-4)}</code> 的反向 <b>${result.direction}</b> 信号，防止左右互搏误平仓！`,
+                { parse_mode: 'HTML' }
+              )
+              .catch(() => {});
+          }
+          return;
+        }
+      }
+
+      const tick = sizing.market?.minQuantityTickSize || 0.001;
+      const tickPrecision = Math.max(0, Math.min(8, -Math.floor(Math.log10(tick))));
+      const finalOrderQty = isReduceOnly
+        ? Number((Math.floor(Math.min(sizing.userQuantity, existingOppositePos!.quantity) / tick) * tick).toFixed(tickPrecision))
+        : sizing.userQuantity;
+      const requiredMargin = isReduceOnly ? 0 : sizing.userMargin;
+
+      if (
+        !sizing.market ||
+        injBal < 0.002 ||
+        finalOrderQty < tick ||
+        (!isReduceOnly && exactQuoteBal < requiredMargin)
+      ) {
+        const warnText = this.formatTradeNotificationText(chatId, effectiveResult, {
+          insufficientRealBalance: {
+            inj: balances.inj,
+            usdt: `${balances.usdt} USDT / ${balances.usdc} USDC`,
+            requiredMargin,
+            userAmountUsdt: sizing.userAmountUsdt,
+          },
+        });
+        const warnKb = new InlineKeyboard()
+          .text('💳 立即充值激活', 'deposit_guide')
+          .text('🧪 一键切换为模拟盘跟单', 'switch_mode_practice')
+          .row()
+          .text('🔙 返回主菜单', 'back_to_menu');
+
+        if (this.bot) {
+          await this.bot.api
+            .sendMessage(chatId, warnText, {
+              parse_mode: 'HTML',
+              reply_markup: warnKb,
+            })
+            .catch(() => {});
+        }
+        return;
+      }
+
+      // 实盘余额充足：使用带滑点保护上限的 protectionPrice 真实签名上链
+      try {
+        const realOrder = await injService.executeUserRealMarketOrder(w.privateKeyHex, {
+          marketId: sizing.market.marketId,
+          direction: result.direction,
+          quantity: finalOrderQty,
+          price: sizing.protectionPrice,
+          fillPrice: sizing.execPrice,
+          leverage: sizing.leverage,
+          isReduceOnly,
+        });
+
+        const fullyClosed = isReduceOnly && existingOppositePos ? finalOrderQty >= existingOppositePos.quantity : false;
+        this.walletService.updateRealPositionOwner(
+          chatId,
+          sizing.market.marketId,
+          result.direction,
+          event?.traderAddress,
+          isReduceOnly,
+          fullyClosed
+        );
+
+        const actualMarginUsed = isReduceOnly
+          ? 0
+          : Number(((finalOrderQty * sizing.execPrice) / sizing.leverage).toFixed(4));
+
+        const text = this.formatTradeNotificationText(chatId, effectiveResult, {
+          realTxHash: realOrder.txHash,
+          userQuantity: finalOrderQty,
+          userMargin: actualMarginUsed,
+          leverage: sizing.leverage,
+        });
+
+        // 仅在实盘真实上链成功后结算邀请返佣
+        const tradeNotional = finalOrderQty * sizing.execPrice;
+        const refRes = this.walletService.recordReferralReward(chatId, tradeNotional);
+        if (refRes && refRes.rewardUsdt >= 0.0001 && this.bot) {
+          await this.bot.api
+            .sendMessage(
+              refRes.referrerId,
+              `💰 <b>【好友实盘跟单返佣到账】</b>\n\n• 来自好友: @${w.username || chatId}\n• 本单产生返佣: <b>+$${refRes.rewardUsdt.toFixed(4)} USDT</b>\n• 您的累计总返佣: <b>$${refRes.totalEarned.toFixed(2)} USDT</b>\n\n👉 <i>随时点击主菜单【🎁 邀请返佣】查看明细与申请提现！</i>`,
+              { parse_mode: 'HTML' }
+            )
+            .catch(() => {});
+        }
+
+        if (this.bot) {
+          await this.bot.api
+            .sendMessage(chatId, text, {
+              parse_mode: 'HTML',
+              link_preview_options: { is_disabled: true },
+            })
+            .catch(() => {});
+        }
+      } catch (err: any) {
+        console.warn(`[TelegramBot] 用户 ${chatId} 实盘广播异常:`, err.message);
+        const errText = this.formatTradeNotificationText(chatId, effectiveResult, {
+          realBroadcastError: err.message || String(err),
+        });
+        if (this.bot) {
+          await this.bot.api.sendMessage(chatId, errText, { parse_mode: 'HTML' }).catch(() => {});
+        }
+      }
+    };
+
+    // 分批并发执行，避免几十上百名用户串行等待造成剧烈滑点或触发限流
+    const batchSize = 5;
+    for (let i = 0; i < matchedFollowers.length; i += batchSize) {
+      const batch = matchedFollowers.slice(i, i + batchSize);
+      await Promise.all(batch.map((w) => processUser(w)));
     }
   }
 }

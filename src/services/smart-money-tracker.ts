@@ -9,10 +9,18 @@ export class SmartMoneyTracker extends EventEmitter {
   private config: AppConfig;
   private injectiveService: InjectiveService;
   private isRunning: boolean = false;
+  private isPolling: boolean = false;
   private pollTimer?: NodeJS.Timeout;
   private processedTradeIds: Set<string> = new Set();
+  private processedOrderHashes: Set<string> = new Set();
+  private readonly maxProcessedCacheSize: number = 10_000;
   private streamSubscriptions: Map<string, any> = new Map();
-  private lastSignalMeta: Map<string, { time: number; direction: string }> = new Map();
+  private reconnectTimers: Map<string, NodeJS.Timeout> = new Map();
+  private reconnectAttempts: Map<string, number> = new Map();
+  private lastSignalMeta: Map<
+    string,
+    { time: number; direction: string; recentNotionals?: Array<{ ts: number; notional: number }> }
+  > = new Map();
   public trackedAddresses: Set<string> = new Set();
   public trackedSubaccounts: Map<string, string> = new Map();
 
@@ -25,8 +33,35 @@ export class SmartMoneyTracker extends EventEmitter {
     }
   }
 
+  private rememberBounded(set: Set<string>, key: string) {
+    if (!key || set.has(key)) return;
+    set.add(key);
+    while (set.size > this.maxProcessedCacheSize) {
+      const oldest = set.values().next().value;
+      if (oldest === undefined) break;
+      set.delete(oldest);
+    }
+  }
+
+  private rememberTradeId(tradeId: string) {
+    this.rememberBounded(this.processedTradeIds, tradeId);
+  }
+
   private registerLocalTarget(address: string, subaccountIndex: number = 0): string {
     let subId = '';
+    if (address.startsWith('0x') && address.length === 66) {
+      subId = address.toLowerCase();
+      try {
+        const bech32 = getInjectiveAddressFromSubaccountId(subId);
+        this.trackedAddresses.add(bech32);
+        this.trackedSubaccounts.set(subId, bech32);
+      } catch {
+        this.trackedAddresses.add(address);
+        this.trackedSubaccounts.set(subId, address);
+      }
+      return subId;
+    }
+
     try {
       subId = getSubaccountId(address, subaccountIndex);
     } catch {
@@ -71,6 +106,11 @@ export class SmartMoneyTracker extends EventEmitter {
       clearInterval(this.pollTimer);
       this.pollTimer = undefined;
     }
+    for (const timer of this.reconnectTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.reconnectTimers.clear();
+    this.reconnectAttempts.clear();
     for (const sub of this.streamSubscriptions.values()) {
       if (sub && typeof sub.unsubscribe === 'function') {
         try {
@@ -91,7 +131,7 @@ export class SmartMoneyTracker extends EventEmitter {
     this.injectiveService.setTargetTrader(address, subaccountIndex);
     const subId = this.registerLocalTarget(address, subaccountIndex);
     console.log(
-      `[SmartMoneyTracker] 🎯 已将巨鲸加入并发监控矩阵: ${address} (当前共监听 ${this.trackedAddresses.size} 位巨鲸)`
+      `[SmartMoneyTracker] 🎯 已将巨鲸加入并发监控矩阵: ${address} (子账户 #${subaccountIndex}, 当前共监听 ${this.trackedAddresses.size} 位巨鲸)`
     );
 
     if (subId) {
@@ -121,6 +161,12 @@ export class SmartMoneyTracker extends EventEmitter {
     for (const [subId, addr] of Array.from(this.trackedSubaccounts.entries())) {
       if (addr.toLowerCase() === cleanKey || addr.toLowerCase().endsWith(cleanKey)) {
         this.trackedSubaccounts.delete(subId);
+        const timer = this.reconnectTimers.get(subId);
+        if (timer) {
+          clearTimeout(timer);
+          this.reconnectTimers.delete(subId);
+        }
+        this.reconnectAttempts.delete(subId);
         const subStream = this.streamSubscriptions.get(subId);
         if (subStream && typeof subStream.unsubscribe === 'function') {
           try {
@@ -156,40 +202,70 @@ export class SmartMoneyTracker extends EventEmitter {
     };
   }
 
+  private scheduleStreamReconnect(subaccountId: string, traderAddress: string) {
+    if (!this.isRunning || !this.trackedSubaccounts.has(subaccountId)) return;
+    if (this.reconnectTimers.has(subaccountId)) return;
+
+    const existing = this.streamSubscriptions.get(subaccountId);
+    if (existing && typeof existing.unsubscribe === 'function') {
+      try {
+        existing.unsubscribe();
+      } catch {
+        // ignore
+      }
+    }
+    this.streamSubscriptions.delete(subaccountId);
+
+    const attempts = (this.reconnectAttempts.get(subaccountId) || 0) + 1;
+    this.reconnectAttempts.set(subaccountId, attempts);
+    const delayMs = Math.min(15_000, 1000 * Math.min(attempts, 10));
+
+    const timer = setTimeout(() => {
+      this.reconnectTimers.delete(subaccountId);
+      if (this.isRunning && this.trackedSubaccounts.has(subaccountId)) {
+        this.subscribeSubaccountStream(subaccountId, traderAddress);
+      }
+    }, delayMs);
+    this.reconnectTimers.set(subaccountId, timer);
+  }
+
+  private subscribeSubaccountStream(subaccountId: string, traderAddress: string) {
+    if (!this.isRunning || this.streamSubscriptions.has(subaccountId)) return;
+    try {
+      const sub = this.injectiveService.derivativesStream.streamTrades({
+        subaccountId,
+        callback: (tradeResponse: any) => {
+          if (!this.isRunning) return;
+          this.reconnectAttempts.set(subaccountId, 0);
+          // @injectivelabs/sdk-ts streamTrades 回调返回 { trade, operation, timestamp }
+          const rawTrade = tradeResponse?.trade ? tradeResponse.trade : tradeResponse;
+          if (rawTrade) {
+            this.handleRawTrade(rawTrade, traderAddress);
+          }
+        },
+        onEndCallback: () => {
+          this.scheduleStreamReconnect(subaccountId, traderAddress);
+        },
+        onStatusCallback: (status) => {
+          // Envoy 对空闲连接定期超时关闭时，主动清理句柄并无缝重连，避免流永久失效
+          if (status && status.code !== 0) {
+            this.scheduleStreamReconnect(subaccountId, traderAddress);
+          }
+        },
+      });
+      this.streamSubscriptions.set(subaccountId, sub);
+    } catch (err: any) {
+      console.warn(`[SmartMoneyTracker] ⚠️ 实时 Stream 启动告警（将使用轮询兜底并尝试重连）:`, err.message);
+      this.scheduleStreamReconnect(subaccountId, traderAddress);
+    }
+  }
+
   /**
    * 为多巨鲸监控矩阵中的所有子账户建立 gRPC 实时流订阅
    */
   private startRealtimeStream() {
     for (const [subaccountId, traderAddress] of this.trackedSubaccounts.entries()) {
-      if (this.streamSubscriptions.has(subaccountId)) continue;
-
-      try {
-        const sub = this.injectiveService.derivativesStream.streamTrades({
-          subaccountId,
-          callback: (tradeResponse) => {
-            if (!this.isRunning) return;
-            this.handleRawTrade(tradeResponse, traderAddress);
-          },
-          onStatusCallback: (status) => {
-            // Injective gRPC Envoy 会对无交易空闲连接进行周期性重置 (DEADLINE_EXCEEDED / Gateway Timeout)
-            // 这是 HTTP/2 长连接心跳正常机制，底层与轮询兜底会自动无缝续期，静默过滤避免刷屏
-            if (
-              status?.code === 2 ||
-              status?.code === 1 ||
-              status?.details === 'Gateway Timeout' ||
-              (typeof (status as any)?.details === 'string' && (status as any).details.includes('Timeout'))
-            ) {
-              return;
-            }
-            if (status && status.code !== 0 && status.details) {
-              console.log(`[SmartMoneyTracker] gRPC Stream 状态更新: ${status.details}`);
-            }
-          },
-        });
-        this.streamSubscriptions.set(subaccountId, sub);
-      } catch (err: any) {
-        console.warn(`[SmartMoneyTracker] ⚠️ 实时 Stream 启动告警（将使用轮询机制兜底）:`, err.message);
-      }
+      this.subscribeSubaccountStream(subaccountId, traderAddress);
     }
     if (this.streamSubscriptions.size > 0) {
       console.log(
@@ -208,27 +284,31 @@ export class SmartMoneyTracker extends EventEmitter {
     }
 
     const poll = async () => {
-      if (!this.isRunning || this.trackedSubaccounts.size === 0) return;
+      if (!this.isRunning || this.isPolling || this.trackedSubaccounts.size === 0) return;
+      this.isPolling = true;
+      try {
+        const entries = Array.from(this.trackedSubaccounts.entries());
+        await Promise.all(
+          entries.map(async ([subaccountId, traderAddress]) => {
+            try {
+              const response = await this.injectiveService.derivativesApi.fetchTrades({
+                subaccountId,
+                pagination: { limit: 10 },
+              });
 
-      const entries = Array.from(this.trackedSubaccounts.entries());
-      await Promise.all(
-        entries.map(async ([subaccountId, traderAddress]) => {
-          try {
-            const response = await this.injectiveService.derivativesApi.fetchTrades({
-              subaccountId,
-              pagination: { limit: 10 },
-            });
-
-            if (response && response.trades && response.trades.length > 0) {
-              for (const trade of response.trades) {
-                this.handleRawTrade(trade, traderAddress);
+              if (response && response.trades && response.trades.length > 0) {
+                for (const trade of response.trades) {
+                  this.handleRawTrade(trade, traderAddress);
+                }
               }
+            } catch {
+              // 忽略单节点瞬时网络抖动，不中断轮询
             }
-          } catch {
-            // 忽略单节点瞬时网络抖动，不中断轮询
-          }
-        })
-      );
+          })
+        );
+      } finally {
+        this.isPolling = false;
+      }
     };
 
     const initialSeeds = Array.from(this.trackedSubaccounts.keys()).map((subId) =>
@@ -242,19 +322,36 @@ export class SmartMoneyTracker extends EventEmitter {
   }
 
   /**
-   * 启动时预载入历史成交，打上已读标记
+   * 启动时预载入历史成交，打上已读标记 (同时去重 tradeId 与 orderHash 并预热冷却时间)
    */
   private async seedInitialTrades(subaccountId: string) {
     try {
       const response = await this.injectiveService.derivativesApi.fetchTrades({
         subaccountId,
-        pagination: { limit: 20 },
+        pagination: { limit: 50 },
       });
       if (response && response.trades) {
+        const nowMs = Date.now();
         for (const t of response.trades) {
           const id = t.tradeId || t.orderHash;
           if (id) {
-            this.processedTradeIds.add(id);
+            this.rememberTradeId(id);
+          }
+          if (t.orderHash) {
+            this.rememberBounded(this.processedOrderHashes, t.orderHash);
+          }
+          const rawTs = Number(t.executedAt || 0);
+          const ts = rawTs > 0 && rawTs < 1e12 ? rawTs * 1000 : rawTs;
+          const execSide = (t.executionSide || '').toLowerCase();
+          if (execSide === 'taker' && ts > 0 && nowMs - ts < 600_000) {
+            const key = `${subaccountId.toLowerCase()}_${t.marketId}`;
+            if (!this.lastSignalMeta.has(key)) {
+              const rawDir = (t.tradeDirection || '').toLowerCase();
+              this.lastSignalMeta.set(key, {
+                time: ts,
+                direction: rawDir.includes('buy') ? 'BUY' : 'SELL',
+              });
+            }
           }
         }
         console.log(`[SmartMoneyTracker] 初始历史交易已去重，过滤历史条目数: ${this.processedTradeIds.size}`);
@@ -265,7 +362,7 @@ export class SmartMoneyTracker extends EventEmitter {
   }
 
   /**
-   * 处理解析单条成交数据并触发事件 (支持精确还原多巨鲸中的具体触发者地址，过滤被动挂单 Maker 与 HFT 刷单)
+   * 处理解析单条成交数据并触发事件 (支持 orderHash 严格去重、陈旧成交过滤、TWAP 拆单防刷屏与多巨鲸还原)
    */
   public handleRawTrade(rawTrade: any, fallbackTraderAddress?: string) {
     if (!rawTrade) return;
@@ -274,8 +371,23 @@ export class SmartMoneyTracker extends EventEmitter {
     if (!tradeId || this.processedTradeIds.has(tradeId)) {
       return;
     }
+    this.rememberTradeId(tradeId);
 
-    this.processedTradeIds.add(tradeId);
+    const orderHash = rawTrade.orderHash || '';
+    if (orderHash) {
+      if (this.processedOrderHashes.has(orderHash)) {
+        return;
+      }
+      this.rememberBounded(this.processedOrderHashes, orderHash);
+    }
+
+    // 过滤陈旧历史成交 (> 2 分钟前)，杜绝重启或重连回放旧单
+    const rawTs = Number(rawTrade.executedAt || 0);
+    const tradeTs = rawTs > 0 && rawTs < 1e12 ? rawTs * 1000 : rawTs;
+    const nowMs = Date.now();
+    if (tradeTs > 0 && nowMs - tradeTs > 120_000) {
+      return;
+    }
 
     // 0. 做市商黑名单防御：若来自已知做市商/套利机器人地址，直接丢弃信号
     if (fallbackTraderAddress && KNOWN_MARKET_MAKERS.has(fallbackTraderAddress.toLowerCase())) {
@@ -297,36 +409,58 @@ export class SmartMoneyTracker extends EventEmitter {
     const rawDir = (rawTrade.tradeDirection || rawTrade.orderSide || '').toLowerCase();
     const direction: TradeDirection = rawDir.includes('buy') ? 'BUY' : 'SELL';
 
-    // Injective 链上成交 executionPrice 是以 10^decimals 缩放的整数字符串 (例如 BRETT 0.003645 是 "3645")
     const price = rawTrade.executionPrice
       ? parseFloat(rawTrade.executionPrice) / divisor
       : parseFloat(rawTrade.price || '0');
     const quantity = parseFloat(rawTrade.executionQuantity || rawTrade.quantity || '0');
     const notionalUsd = price * quantity;
 
-    // 2. 严格过滤碎单与微额自动化调仓：单笔名义金额低于 $50 USD 的视为噪声直接跳过 (杜绝跟随 $1.42 等微型碎单磨损)
-    if (notionalUsd < 50) {
+    // 2. 过滤碎单与小额 TWAP 定投拆单 (默认 >= $150)
+    const minNotional = this.config.minSignalNotionalUsd ?? 150;
+    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(quantity) || quantity <= 0 || notionalUsd < minNotional) {
       return;
     }
 
     const subId = (rawTrade.subaccountId || this.injectiveService.targetSubaccountId || '').toLowerCase();
 
-    // 2. 子账户 + 市场级冷却与高频双向刷单 (HFT Wash-Trading) 过滤
+    // 3. 子账户 + 市场级冷却、TWAP 重复拆单限流与 HFT 高频双向刷单过滤
     const signalKey = `${subId}_${rawTrade.marketId}`;
-    const nowMs = Date.now();
+    const cooldownMs = this.config.signalCooldownMs ?? 180_000;
     const prevMeta = this.lastSignalMeta.get(signalKey);
+    let recentNotionals = prevMeta?.recentNotionals ? [...prevMeta.recentNotionals] : [];
+    recentNotionals = recentNotionals.filter((x) => nowMs - x.ts <= 15 * 60_000);
+
     if (prevMeta) {
       const elapsedMs = nowMs - prevMeta.time;
-      // 同方向 30 秒冷却，防止单笔大单被拆分成多笔小 fill 时在 1 分钟内连续重复下单
-      if (prevMeta.direction === direction && elapsedMs < 30_000) {
+      // 同方向默认 3 分钟冷却，防止 TWAP / 拆分大单高频重复触发
+      if (prevMeta.direction === direction && elapsedMs < cooldownMs) {
         return;
+      }
+      // 实时 TWAP 拆单拦截：15 分钟内连续 >= 3 笔同向小单 (< $400) 且金额高度接近 (最大/最小 <= 1.2)，30 分钟内抑制重复
+      if (prevMeta.direction === direction && notionalUsd < 400 && recentNotionals.length >= 3) {
+        const last3 = recentNotionals.slice(-3).map((x) => x.notional);
+        const allNums = [...last3, notionalUsd];
+        const minN = Math.min(...allNums);
+        const maxN = Math.max(...allNums);
+        if (minN > 0 && maxN / minN <= 1.2 && elapsedMs < 30 * 60_000) {
+          return;
+        }
       }
       // 45 秒内反向翻转 (BUY <-> SELL) 且单笔规模 < $5,000，判定为 HFT 网格高频刷单并跳过
       if (prevMeta.direction !== direction && elapsedMs < 45_000 && notionalUsd < 5000) {
         return;
       }
     }
-    this.lastSignalMeta.set(signalKey, { time: nowMs, direction });
+    recentNotionals.push({ ts: nowMs, notional: notionalUsd });
+    if (recentNotionals.length > 6) recentNotionals = recentNotionals.slice(-6);
+    this.lastSignalMeta.set(signalKey, { time: nowMs, direction, recentNotionals });
+    if (this.lastSignalMeta.size > 5000) {
+      for (const [k, v] of this.lastSignalMeta.entries()) {
+        if (nowMs - v.time > 1800_000) {
+          this.lastSignalMeta.delete(k);
+        }
+      }
+    }
 
     let resolvedTrader =
       this.trackedSubaccounts.get(subId) ||
